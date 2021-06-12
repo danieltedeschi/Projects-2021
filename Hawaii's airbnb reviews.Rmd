@@ -1,0 +1,2542 @@
+---
+title: "Hawaii's airbnb reviews analysis"
+author: "Daniel Tedeschi Samaia"
+date: "31/05/2021"
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## 1 Data Preparation
+
+### 1.1 Downloading Data - Downloading Hawaii Files
+
+```{bash eval =FALSE}
+#change current dictionary and create new folder for download files to avoid large files in the GitHub respository
+
+cd ../../Downloads
+mkdir Hawaii_Data
+cd Hawaii_Data
+cd ../../Downloads/Hawaii_Data
+
+wget "http://data.insideairbnb.com/united-states/hi/hawaii/2021-04-14/data/listings.csv.gz"
+wget "http://data.insideairbnb.com/united-states/hi/hawaii/2021-04-14/data/review
+s.csv.gz"
+wget "http://data.insideairbnb.com/united-states/hi/hawaii/2021-04-14/data/calendar.csv.gz"
+wget "http://data.insideairbnb.com/united-states/hi/hawaii/2021-04-14/visualisations/neighbourhoods.csv"
+wget "http://data.insideairbnb.com/united-states/hi/hawaii/2021-04-14/data/reviews.csv.gz"
+
+
+mkdir Hawaii_rds_files
+```
+
+### 1.2 Reading files into R
+
+```{r intial_file_reading, eval=FALSE}
+reviews <- readr::read_csv("..\\..\\Downloads\\Hawaii_Data\\reviews.csv.gz")
+listings <- readr::read_csv("..\\..\\Downloads\\Hawaii_Data\\listings.csv.gz")
+calendar <- readr::read_csv("..\\..\\Downloads\\Hawaii_Data\\calendar.csv.gz")
+neighbourhoods <- readr::read_csv("..\\..\\Downloads\\Hawaii_Data\\neighbourhoods.csv")
+
+
+#save files as .rds to be able to import them faster in following sessions
+
+saveRDS(reviews,"Hawaii_rds_files/reviews.rds")
+saveRDS(listings, "Hawaii_rds_files/listings.rds")
+saveRDS(neighbourhoods, "Hawaii_rds_files/neighbourhoods.rds")
+saveRDS(calendar, "Hawaii_rds_files/calendar.rds")
+```
+
+### 1.3 Data Cleaning
+
+```{r libraries, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(tidytext)
+library(dplyr)
+library(stringr)
+library(tm)
+library(qdap)
+library(wordcloud)
+library(magrittr)
+#library(MASS) #not imported due to overlapping functions
+library(leaps)
+library(psych)
+library(textdata)
+library(stm)
+library(stargazer)
+library(geometry)
+library(Rtsne)
+library(rsvd)
+
+```
+
+```{r eval =TRUE}
+#read prepared .rds files
+reviews_data <- readRDS("..//Hawaii_rds_files//reviews.rds")
+listings_data <- readRDS("..//Hawaii_rds_files//listings.rds")
+```
+
+```{r file_length}
+review_data_lenght <- format(length(reviews_data$id), big.mark = ",")
+print(paste("The chosen dataset has", review_data_lenght, "rows."))
+```
+
+```{r manipulating_listings}
+#create new variable for manipulation while keeping the original data to go back if necessary
+listings <- listings_data
+
+#remove commas in listings price
+listings$price <- gsub(pattern = "\\,", "", listings$price)
+
+#remove dollar sign and convert to numeric
+listings$price <- as.numeric(gsub(pattern = "\\$", "", listings$price))
+
+```
+
+### 1.4 Data reduction
+
+\#\#\#\#1.4.1 Removing automated Postings due to cancellation
+
+```{r automated_cancellation_reviews }
+#identify all reviews that include the pattern "is an automated posting"
+reviews_data <- reviews_data %>% mutate(exclude = stringr::str_detect(comments, "is an automated posting"))
+
+exluded_automated_reviews <- reviews_data %>% filter(exclude == TRUE)#
+head(exluded_automated_reviews$comments)
+
+#removing these reviews from the data set and remove the column exclude again
+reviews_data <- reviews_data %>% filter(exclude == FALSE) %>% select(-exclude)
+
+
+#ensure that all characters are converted corretly
+reviews_data$comments <- iconv(reviews_data$comments)
+
+```
+
+#### 1.4.1 Data Exploration
+
+Analysing the frequency of reviews for each listing to eliminate reviews that have very few reviews, as they might not be representative.
+
+```{r reviews_per_listing}
+reviews_per_listing <- reviews_data %>% group_by(listing_id) %>% count(listing_id, sort = TRUE)  
+
+reviews_per_listing  %>% ggplot(., aes(x=n)) + geom_histogram() + labs(title="Frequency of listings", x="Number of listings", y="frequency")
+
+reviews_per_listing  %>% ggplot(., aes(x=n, listing_id)) + geom_col()
+
+reviews_per_listing %>% group_by(n) %>% summarise(n())
+
+quantile(reviews_per_listing$n,  na.rm = TRUE, c(0.025, 0.975))
+
+#to have representative listings, we exclude listings that have only 1 review and more than 186 reviews
+selected_listings <- reviews_per_listing %>% filter(between(n, 2, 187)) %>% select(listing_id) %>% ungroup() %>% unlist()
+
+```
+
+#### 1.4.2 Checking for professional reviewers
+
+```{r professinal_reviews}
+reviews_per_reviewer_id <- reviews_data %>% group_by(reviewer_id) %>% count(sort = TRUE)# %>% filter(n>10)
+
+#check quantile
+quantile(reviews_per_reviewer_id$n,  na.rm = TRUE, c(0.025, 0.975))
+# -> this would remove too much so we will exclude only the ones with more than 20 reviews -> assumption: we cannot also not exclude all the reviews with one review only since most people will most likely fly to Hawaii once and hence live a maximum of one review
+
+reviews_per_reviewer_id %>% filter(n>10) %>% ggplot(., aes(x=n)) + geom_histogram() + labs(x="Number of reviews", y="Frequency", title=" Identifying professional reviewers")
+
+reviews_per_reviewer_id  %>% filter(n>10)%>% ggplot(., aes(x=n, y= reviewer_id, fill = ifelse(n<20, TRUE, FALSE))) + geom_col() + coord_flip()
+
+```
+
+ASSUMPTION: less than 10 cannot be professional -\> review all with more than 20?
+
+#### 1.4.3 Analysing time frame
+
+```{r adding_year_month}
+#adding year and month column
+reviews_data$month <- lubridate::month(reviews_data$date)
+reviews_data$year <- lubridate::year(reviews_data$date)
+
+```
+
+```{r plotting_reviews_per_year}
+reviews_data %>% group_by(year) %>% count(id, year, sort = TRUE) %>% summarise(reviews_per_year = sum(n)) %>% ggplot(., aes(x=year, y= reviews_per_year))+geom_col() + labs(x="Year", Y="Reviews", title=" Number of reviews per year")
+```
+
+```{r plotting_year_month}
+reviews_data %>% filter(year>=2019) %>% group_by(month, year) %>% mutate(month = factor(month)) %>%  count(id, sort = TRUE) %>% summarise(reviews_per_month = sum(n)) %>% ggplot(., aes(x=month, y= reviews_per_month))+geom_col() + facet_wrap(~year)
+
+```
+
+```{r plotting_year_month_full}
+reviews_data %>% filter(year<=2020 & year > 2011) %>% group_by(month, year) %>% mutate(month = factor(month)) %>% count(id, sort = TRUE) %>% summarise(reviews_per_month = sum(n)) %>% ggplot(., aes(x=month, y= reviews_per_month))+geom_col() + facet_wrap(~year)+ labs(x="month", y="Reviews", title="Reviews per month")
+```
+
+```{r reviews_word_count}
+reviews_data <- reviews_data %>% mutate(words_per_review = stringr::str_count(comments, "\\S+")) #counting the words using the pattern S+ to detect words
+
+#examine top 2.5 % and 97.5% quantiles in order to keep 95 % of the data
+quantile(reviews_data$words_per_review, na.rm = TRUE, c(0.025, 0.975))
+```
+
+This is why we remove all reviews with less than 2 words and with more than 211 words.
+
+#### 1.4.4 Creating subset for further analysis
+
+```{r create_subset}
+#save reviewer IDs with more than 20 reviews in a new variables to remove them with an anti join
+professional_reviewer_ids <- reviews_per_reviewer_id %>% filter(n>20) %>% select(reviewer_id)
+
+#save as new variable and detect the language in the smaller data
+reviews_for_detection <- reviews_data   %>% filter((date > "2016-01-01") & (date < "2020-03-25"), between(words_per_review, 3, 212)) %>% filter(listing_id %in% selected_listings) %>% anti_join(professional_reviewer_ids)
+
+#removed all reviews after covid, kept the inner 95% of the words_per_review and listings_per_review
+```
+
+### 1.5 Language and Sentence Detection
+
+#### 1.5.1 Evaluate Perfomance of language packages
+
+```{r eval=FALSE}
+performance_test_comments <- reviews_data$comments[1:10000]
+
+system.time(cld3::detect_language(performance_test_comments))
+system.time(textcat::textcat(performance_test_comments))
+
+```
+
+The cld3 package seems to be faster than the textcat package. Hence, we will use cld3 for our analysis.
+
+#### 1.5.2 Language Detection
+
+Specifying variables for parallel processing
+```{r parallel_processing, eval=FALSE}
+# Specify the number of cores
+no_cores <- parallel::detectCores() - 1
+
+# Initiate cluster
+cl <- parallel::makeCluster(no_cores)
+
+#### Paralell Language detection
+
+#apply parallel language detection
+reviews_for_detection$language <- parallel::parSapply(cl, X = reviews_for_detection$comments, FUN = cld3::detect_language)
+
+#inspect non english comments
+non_english <- reviews_for_detection %>% filter(language != "en")
+head(non_english$comments, n = 30)
+length(non_english$id)
+
+#stop cluster
+parallel::stopCluster(cl)
+```
+
+#### 1.5.2 Sentence Detection
+
+```{r sent_detect, eval=FALSE}
+
+#remove non-english from the data frame before sentence detection
+reviews_for_detection <- reviews_for_detection %>% filter(language == "en")
+
+#parallel detection of sentence leght
+reviews_for_detection$sentence_count <- parallel::parSapply(cl, X = reviews_for_detection$comments, FUN = quanteda::nsentence)
+```
+
+```{r eval=FALSE, echo=FALSE}
+saveRDS(reviews_for_detection, "reviews_for_detection_processed.rds")
+```
+
+```{r read_reviews_for_detection, echo = FALSE}
+reviews_for_detection <- readRDS("..//Appendix_Files//reviews_for_detection_processed.rds")
+```
+
+```{r plot_after_detection}
+quantile(reviews_for_detection$sentence_count, na.rm = TRUE, c(0.025, 0.975))
+table(reviews_for_detection$sentence_count)
+hist(reviews_for_detection$sentence_count)
+```
+
+16425 reviews will be exluded
+
+```{r filter_sent_count, eval =FALSE}
+reviews <- reviews_for_detection %>% filter(between(sentence_count, 2, 11))
+saveRDS(reviews, "reviews_cleaned.rds")
+```
+
+```{r read_reviews_cleaned, echo = FALSE}
+reviews <- readRDS("..//Appendix_Files//reviews_cleaned.rds")
+```
+
+```{r plot_words_per_review_and_sentence_count}
+hist(reviews$words_per_review)
+reviews_for_detection %>% ggplot(.,aes(x=sentence_count))+geom_histogram(binwidth = 1) + labs(x="Number of sentences", y="Frequency", title="Sentence count per reviews")
+```
+
+## 2 Part A Construction of Corpus - Airbnb Reviews
+
+### 2.1 Pre-Processing
+
+#### 2.1.1 Removing Punctuation
+```{r removing_numbers_from_comments, eval= FALSE}
+#Removing numbers from the reviews
+reviews$comments <- gsub('[[:digit:]]+',' ', reviews$comments)
+#Removing punctuation from the reviews
+reviews$comments <- gsub('[[:punct:]]+',' ', reviews$comments)
+```
+
+#### 2.1.2 Tokenization for Reviews
+
+```{r remove_stopwords}
+#convert fry's list to suitable df
+fry <- as.data.frame(lexicon::sw_fry_1000) %>% rename(word = `lexicon::sw_fry_1000`)
+
+#tokenize reviews and remove stopwords and fry's list
+reviews_tokens <- reviews %>% unnest_tokens(word, comments) %>% anti_join(stop_words) %>% anti_join(fry)
+format(length(reviews_tokens$listing_id), big.mark = ",")
+```
+
+#### 2.1.3 Stemming and Lemmatisation
+(runs approx 33 minutes)
+
+\#\#\#Download language model and define cores for parallel processing
+
+```{r updpipe_reviews,  eval =FALSE}
+#download english model from udpipe
+langmodel_download <- udpipe::udpipe_download_model("english")
+
+#load model
+langmodel <- udpipe::udpipe_load_model(langmodel_download$file_model)
+
+# Specify the number of cores
+no_cores <- parallel::detectCores() - 1
+
+### Run udpipe on reviews
+postagged_reviews <- udpipe:: udpipe(object = langmodel, x = reviews_tokens$word, parallel.cores = no_cores,
+                    parallel.chunks = 100,
+                    trace = T)
+
+postagged_reviews_df <- as.data.frame(postagged_reviews)
+
+#stop cluster
+parallel::stopCluster(cl)
+
+```
+
+```{r eval=FALSE, echo= FALSE}
+saveRDS(postagged_reviews_df, "postagged_tokens_reviews.rds" )
+```
+
+```{r echo =FALSE}
+postagged_reviews_df <- readRDS("..//Appendix_Files//postagged_tokens_reviews.rds")
+```
+
+UDPIPE FOR LISTING DESCRIBTION
+```{r udpipe_listing, eval =TRUE}
+unique_listing_ids_with_reviews <- reviews %>% select(listing_id) %>% unique() %>% inner_join(listings, by = c("listing_id" = "id"))
+
+#ensure that all characters are converted correctly
+unique_listing_ids_with_reviews$description <- iconv(unique_listing_ids_with_reviews$description)
+
+#Removing numbers from the reviews
+unique_listing_ids_with_reviews$description <- gsub('[[:digit:]]+',' ', unique_listing_ids_with_reviews$description)
+
+```
+
+Remove problematic listings that are not fully in English.
+```{r lang_detect_listing, eval =TRUE}
+# Specify the number of cores
+no_cores <- parallel::detectCores() - 1
+
+# Initiate cluster
+cl <- parallel::makeCluster(no_cores)
+
+#apply parallel language detection
+unique_listing_ids_with_reviews$language <- parallel::parSapply(cl, X = unique_listing_ids_with_reviews$description, FUN = cld3::detect_language)
+
+#stop cluster
+parallel::stopCluster(cl)
+
+#inspect non english comments
+non_english_descriptions <- unique_listing_ids_with_reviews %>% filter(language != "en")
+length(non_english_descriptions$listing_id)
+
+#remove non-english listings from
+unique_listing_ids_with_reviews <- unique_listing_ids_with_reviews %>% filter(language == "en")
+
+#save variable for later use on readability
+listings_to_analyse <- unique_listing_ids_with_reviews
+
+```
+
+```{r}
+#Removing punctuation from the describtions
+unique_listing_ids_with_reviews$description <- gsub('[[:punct:]]+',' ', unique_listing_ids_with_reviews$description)
+```
+
+Tokenization on listings
+```{r tokenize_listigns}
+#tokenization and removing stop words and frys list
+listings_tokens <- unique_listing_ids_with_reviews %>% unnest_tokens(word, description) %>% anti_join(stop_words) %>% anti_join(fry)
+```
+
+Udpipe on listings
+```{r eval =FALSE}
+postagged_listings <- udpipe:: udpipe(object = langmodel, x = listings_tokens$word,
+                             parallel.cores = no_cores,
+                             parallel.chunks = 100,
+                             trace = T)
+
+postagged_listings_df <- as.data.frame(postagged_listings)
+
+saveRDS(postagged_listings_df, "postagged_description.rds" )
+```
+
+```{r echo = FALSE}
+postagged_listings_df <- readRDS("..//Appendix_Files//postagged_description.rds")
+```
+
+\#TF-IDF for reviews on lemmatized words
+
+
+#### 2.1.4 Joining Postagged Data with other information from reviews_tokens
+```{r}
+reviews_ids <- reviews_tokens %>% mutate(doc_id = row_number()) %>% select(doc_id, id, listing_id, reviewer_id)
+
+length(unique(postagged_reviews_df$doc_id))
+length(reviews_ids$doc_id)
+
+postagged_reviews_df_joined <- postagged_reviews_df %>% mutate(doc_id = as.numeric(doc_id)) %>% left_join(reviews_ids, by = "doc_id")
+
+```
+
+#### 2.1.5 Removing short and long words from reviews output of udpipe
+```{r}
+postagged_reviews_df_joined$word_length <- nchar(postagged_reviews_df_joined$lemma)
+
+quantile(postagged_reviews_df_joined$word_length, c(0.025, 0.975))
+
+length(postagged_reviews_df_joined$lemma)
+
+#remove all words that are longer than 10 characters and shorter than two characters
+postagged_reviews_df_joined_shortened <- postagged_reviews_df_joined %>% filter(between(word_length, 3, 12))
+
+length(postagged_reviews_df_joined_shortened$lemma)
+
+length(postagged_reviews_df_joined$lemma) - length(postagged_reviews_df_joined_shortened$lemma)
+
+```
+
+
+* Joining the lemmatized udpipe output of listing describtion with the other variables in the data frame
+```{r}
+listings_tokens <- listings_tokens %>% mutate(doc_id = row_number())
+length(unique(listings_tokens$doc_id))
+length(unique(postagged_listings_df$doc_id))
+
+postagged_listings_df_joined <- postagged_listings_df  %>% mutate(doc_id = as.numeric(doc_id)) %>% left_join(listings_tokens)
+
+```
+
+* Removing short and long words from listings output of udpipe
+```{r}
+postagged_listings_df_joined$word_length <- nchar(postagged_listings_df_joined$lemma)
+
+quantile(postagged_listings_df_joined$word_length, c(0.025, 0.975))
+
+length(postagged_listings_df_joined$lemma)
+
+#remove all words that are longer than 10 characters and shorter than two characters
+postagged_listings_df_joined_shortened <- postagged_listings_df_joined %>% filter(between(word_length, 3, 12))
+
+length(postagged_listings_df_joined_shortened$lemma)
+
+length(postagged_listings_df_joined$lemma) - length(postagged_listings_df_joined_shortened$lemma)
+
+
+```
+
+
+#### 2.1.6 Removing Stopwords again after lemmatisation on reviews
+```{r removing_stopwords_after_lemma_reviews}
+#removing stopwords again after lemmatisation
+postagged_reviews_df_joined_short <- postagged_reviews_df_joined_shortened %>% mutate(word = lemma) %>% anti_join(stop_words) %>% anti_join(fry)
+
+
+length(postagged_reviews_df_joined_short$lemma)
+
+#calculate difference
+format((length(postagged_reviews_df_joined_shortened$lemma) -length(postagged_reviews_df_joined_short$lemma)), big.mark = ",")
+
+```
+
+#### 2.1.7 Removing Stopwords again after lemmatisation on listings
+
+```{r removing_stopwords_after_lemma_listings}
+postagged_listings_df_joined_short <- postagged_listings_df_joined_shortened %>% mutate(word = lemma) %>% anti_join(stop_words) %>% anti_join(fry)
+
+
+length(postagged_listings_df_joined_short$lemma)
+
+#calculate difference
+format((length(postagged_listings_df_joined_shortened$lemma) -length(postagged_listings_df_joined_short$lemma)), big.mark = ",")
+```
+```{r read_postagged_rds, echo=FALSE}
+postagged_listings <- readRDS("..//Appendix_Files//postagged_listings_joined_clean.rds")
+postagged_reviews <- readRDS("..//Appendix_Files//postagged_reviews_joined_clean.rds")
+```
+
+#### 2.1.8 Performing TF_IDF
+```{r calc_word_counts}
+#calculate word counts
+tokens_count_all <- postagged_reviews %>% count(lemma, sort = TRUE) 
+tokens_count_listing <- postagged_reviews  %>%  group_by(listing_id) %>% count(lemma, sort = TRUE)
+```
+
+* TF_IDF on reviews
+```{r tf-idf_calc}
+TF_IDF <- tokens_count_listing %>% bind_tf_idf(lemma, listing_id, n) %>% arrange(desc(tf_idf))
+```
+
+```{r eval =FALSE}
+quantile(TF_IDF$tf_idf, na.rm = T, c(0.025, 0.975))
+```
+\#PLOTTING THE TF_IDF
+
+```{r eval =TRUE}
+TF_IDF %>% group_by(listing_id) %>% filter(tf_idf >0.07) %>% ggplot(., aes(x=lemma, y=tf_idf)) + geom_col() + coord_flip() + labs(x= "Lemmatized word", y="TF-IDF value", title=" TF-IDF greater than 0.7")
+
+TF_IDF %>% filter(tf_idf >0.1) %>% ggplot(., aes(x=tf_idf))+geom_histogram(bins = 80)
+```
+
+```{r eval =FALSE}
+hist(TF_IDF$tf_idf, breaks=100, main="TF-IDF")
+```
+
+
+```{r}
+TF_IDF %>% filter(tf_idf < 2) %>% ggplot(., aes(x=tf_idf))+geom_histogram()
+```
+```{r}
+TF_IDF %>% filter(tf_idf < 0.5) %>% ggplot(., aes(x=tf_idf))+geom_histogram()
+```
+
+```{r}
+TF_IDF %>% filter(tf_idf < 0.1) %>% ggplot(., aes(x=tf_idf))+geom_histogram() + labs(title="Distribution of TF-IDF", x="TF-IDF", y="Frequency")
+```
+
+
+```{r eval=FALSE}
+tidy_review <- TF_IDF %>% filter(tf_idf < 0.074 ) %>% mutate(word = lemma) %>% left_join(listings, by = c("listing_id" = "id"))
+```
+
+
+```{r eval=FALSE}
+saveRDS(tidy_review, "tidy_review.rds")
+```
+
+```{r read_tidy_review}
+tidy_review <- readRDS("tidy_review.rds")
+```
+
+
+* TF-IDF for listings
+```{r tf-idf_listings}
+listings_tokens_count <- postagged_listings %>%  group_by(listing_id) %>% count(lemma, sort = TRUE)
+
+TF_IDF_listing <- listings_tokens_count %>% bind_tf_idf(lemma, listing_id, n) %>% arrange(desc(tf_idf))
+
+tf_if_cutoffs <- quantile(TF_IDF_listing$tf_idf, na.rm = T, c(0.025, 0.975))
+
+quantile(TF_IDF$tf_idf, na.rm = T, c(0.025, 0.975))
+# tf_idf_low_cutoff <- tf_if_cutoffs[1]
+
+tf_idf_listing_high_cutoff <- tf_if_cutoffs[2]
+
+
+tidy_listing <- TF_IDF_listing %>% filter(tf_idf < tf_idf_listing_high_cutoff ) %>% mutate(word = lemma) %>% left_join(listings, by = c("listing_id" = "id"))
+
+```
+
+```{r eval=FALSE, echo =FALSE}
+saveRDS(tidy_listing, "tidy_listing.rds" )
+```
+
+```{r eval=TRUE, echo=FALSE}
+tidy_listing <- readRDS("tidy_listing.rds")
+```
+
+
+
+
+### 2.2 QUESTIONS PART A
+
+#### 2.2.1 Dominant words per aggregation category
+```{r eval =FALSE}
+#count and visualise the top 20 frequent words in general
+word_counts_general <- tidy_review %>% 
+  mutate(word2=fct_reorder(word, n)) %>% top_n(20)
+
+ggplot(word_counts_general, aes(x=word2, y=n)) +geom_col(show.legend = FALSE) + coord_flip()
+
+#word_counts_general %>% wordcloud(word=word, freq= n, min.freq=1, max.words=30)
+```
+```{r eval =TRUE}
+#count and visualise the top 10 dominant words by neighbourhood in reviews
+word_counts_neighbourhood <- tidy_review %>%
+  group_by(neighbourhood_group_cleansed) %>%
+  count(word, neighbourhood_group_cleansed) %>%
+  top_n(10,n) %>%
+  ungroup() %>%
+  arrange(desc(n)) %>%
+  mutate(word2=fct_reorder(word, n))
+
+print(word_counts_neighbourhood)
+
+ggplot(word_counts_neighbourhood, aes(x=word2, y=n, fill=neighbourhood_group_cleansed)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~neighbourhood_group_cleansed, scales="free_y" ) +
+  coord_flip() + labs(title="DOMINANT WORDS PER NEIGHBOURHOOD IN REVIEWS", x= "Words", y="Frequency")
+
+```
+
+```{r}
+#count and visualise the top 10 dominant words by neighbourhood in listing
+word_counts_neighbourhood <- tidy_listing %>%
+  group_by(neighbourhood_group_cleansed) %>%
+  count(word, neighbourhood_group_cleansed) %>%
+  top_n(10,n) %>%
+  ungroup() %>%
+  arrange(desc(n)) %>%
+  mutate(word2=fct_reorder(word, n))
+
+print(word_counts_neighbourhood)
+
+ggplot(word_counts_neighbourhood, aes(x=word2, y=n, fill=neighbourhood_group_cleansed)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~neighbourhood_group_cleansed, scales="free_y" ) +
+  coord_flip() + labs(title="DOMINANT WORDS PER NEIGHBOURHOOD IN DESCRIPTIONS", x= "Words", y="Frequency")
+```
+
+```{r eval =TRUE}
+#count and visualise the top 10 dominant words by room_type in reviews
+word_counts_roomtype <- tidy_review %>%
+  group_by(room_type) %>%
+  count(word, room_type) %>%
+  top_n(10,n) %>% ungroup() %>%
+  arrange(desc(n)) %>%
+  mutate(word2=fct_reorder(word, n))
+
+print(word_counts_roomtype)
+
+ggplot(word_counts_roomtype, aes(x=reorder(word2,n), y=n, fill=room_type)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~room_type, scales="free") + coord_flip() + labs(title="DOMINANT WORDS PER ROOM TYPE IN REVIEWS", x="Frequency", y="words")
+```
+
+```{r}
+#count and visualise the top 10 dominant words by room_type in listing
+word_counts_roomtype <- tidy_listing %>%
+  group_by(room_type) %>%
+  count(word, room_type) %>%
+  top_n(10,n) %>% ungroup() %>%
+  arrange(desc(n)) %>%
+  mutate(word2=fct_reorder(word, n))
+
+print(word_counts_roomtype)
+
+ggplot(word_counts_roomtype, aes(x=reorder(word2,n), y=n, fill=room_type)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~room_type, scales="free") +
+  coord_flip() + labs(title="DOMINANT WORDS PER ROOM TYPE IN LISTINGS", x="Frequency", y="words")
+```
+
+
+```{r eval =TRUE}
+#count and visualise the top 10 dominant words by host_is_superhost in reviews
+word_counts_superhost <- tidy_review %>%
+  group_by(host_is_superhost) %>%
+  count(word, host_is_superhost) %>%
+  top_n(10,n) %>% ungroup() %>%
+  arrange(desc(n)) %>%
+  mutate(word2=fct_reorder(word, n))
+
+print(word_counts_superhost)
+
+ggplot(word_counts_superhost, aes(x=word2, y=n, fill=host_is_superhost)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~host_is_superhost, scales = "free_y") +
+  coord_flip()+ labs(title="DOMINANT WORDS PER SUPERHOST IN REVIEWS", x="Frequency", y="Word")
+```
+
+
+```{r}
+#count and visualise the top 10 dominant words by host_is_superhost in listing
+word_counts_superhost <- tidy_listing %>%
+  group_by(host_is_superhost) %>%
+  count(word, host_is_superhost) %>%
+  top_n(10,n) %>% ungroup() %>%
+  arrange(desc(n)) %>%
+  mutate(word2=fct_reorder(word, n))
+
+print(word_counts_superhost)
+
+ggplot(word_counts_superhost, aes(x=word2, y=n, fill=host_is_superhost)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~host_is_superhost, scales = "free_y") +
+  coord_flip()+ labs(title="DOMINANT WORDS PER SUPERHOST IN LISTING", x="Frequency", y="Word")
+```
+
+
+
+#### 2.2.2 The most common word combinations used to describe a property listing
+
+```{r most_common_word_combinations }
+# Select the top 10 word and see the correlations of other words associated to it
+listing_dtm <- tidy_listing %>%
+  cast_dtm(listing_id, word, n)
+
+listing_top10_term <- tidy_listing %>%
+  group_by(word) %>%
+  summarise(total = n()) %>%
+  arrange(desc(total)) %>%
+  top_n(10)
+
+associations <- for(term in 1:nrow(listing_top10_term)) {
+
+    association <- findAssocs(listing_dtm,listing_top10_term$word[term], 0.10)
+  print(association)  
+}
+
+#the result shows that there wasn't any significant correlations of words with the top 10 words as the highest correlations were "guest access" at 0.45.
+```
+```{r eval=FALSE}
+saveRDS(associations, "associations.rds")
+```
+
+
+
+```{r bigrams, eval=FALSE}
+#We shall try and use bigrams
+#tokenise description of listing
+
+review_bigrams <- unique_listing_ids_with_reviews %>%
+  unnest_tokens(bigram, description, token = "ngrams", n = 2)
+
+bigrams_separated <- review_bigrams %>%
+  separate(bigram, c("word1", "word2"), sep = " ")
+
+bigrams_filtered <- bigrams_separated %>%
+  filter(!word1 %in% stop_words$word) %>%
+  filter(!word2 %in% stop_words$word) %>%
+  filter(word1 != "br", word2 !="br")
+
+bigram_counts <- bigrams_filtered %>%
+  count(word1, word2, sort = TRUE)
+
+bigrams_united <- bigrams_filtered %>%
+  unite(bigram, word1, word2, sep = " ")
+
+bigrams_united %>%
+  count(bigram, sort = TRUE)
+
+bigram_counts
+#The most common bigrams are “ocean view” followed by "guest access"
+```
+
+```{r saveRDS_bigrams, eval=FALSE, echo=FALSE}
+saveRDS(bigram_counts, "bigram_counts.rds")
+saveRDS(bigrams_united, "bigrams_united.rds")
+```
+
+```{r readRDS_bigrams, echo=FALSE}
+bigram_counts <- readRDS("bigram_counts.rds")
+bigrams_united <- readRDS("bigrams_united.rds")
+```
+
+```{r bigrams_plot}
+# Visualising bigrams using directed graph
+library(ggraph)
+library(igraph)
+set.seed(2020)
+
+# filter for only relatively common combinations
+bigram_graph <- bigram_counts %>%
+  filter(n > 500) %>%
+  graph_from_data_frame()
+
+#ggraph(bigram_graph, layout = "fr") +
+#  geom_edge_link() +
+#  geom_node_point() +
+#  geom_node_text(aes(label = name), vjust = 1, hjust = 1)
+
+a <- grid::arrow(type = "closed", length = unit(.08, "inches"))
+
+ggraph(bigram_graph, layout = "fr") +
+  geom_edge_link(aes(edge_alpha = n), show.legend = FALSE,
+                 arrow = a, end_cap = circle(.05, 'inches')) +
+  geom_node_point(color = "lightblue", size = 3) +
+  geom_node_text(aes(label = name), vjust = 1, hjust = 1) +
+  theme_void()
+```
+
+
+```{r widyr}
+#Whilst tokenizing by n-grams is useful to find pairs of adjacent words, there may also be words that tend to occur within the same description even if they don't occur next to each other. Here, the pairwise_count() function comes into play.
+
+library(widyr)
+
+review_subject <- unique_listing_ids_with_reviews %>%
+  mutate(line = row_number()) %>%
+  unnest_tokens(word, description) %>%
+  anti_join(stop_words)
+
+my_stopwords <- data_frame(word = c(as.character(1:10), "br"))
+review_subject <- review_subject %>%
+  anti_join(my_stopwords)
+
+word_pairs <- review_subject %>%
+  pairwise_count(word, listing_id, sort = TRUE, upper = FALSE)
+
+word_pairs
+
+# Visualising pairs of words in network graph
+set.seed(1234)
+
+word_pairs %>%
+  filter(n >= 1000) %>%   # common bigrams in listing description, showing those that occurred at least 1000 times
+  graph_from_data_frame() %>%
+  ggraph(layout = "fr") +
+  geom_edge_link(aes(edge_alpha = n, edge_width = n), edge_colour = "cyan4") +
+  geom_node_point(size = 3) +
+  geom_node_text(aes(label = name), repel = TRUE,
+                 point.padding = unit(0.2, "lines")) +
+  ggtitle('Word Network in Airbnb Listing Description')
+  theme_void()
+
+#The network graph shows strong connection between the top several words such as beach, space, ocean, kitchen, etc.
+```
+
+```{r pairwise_correlation}
+#Examining Pairwise Correlation
+#Filter for atleast relatively common words first
+
+word_cors <- review_subject %>%
+  group_by(word) %>%
+  filter(n() >=1000) %>%
+  pairwise_cor(word, line, sort = TRUE)
+
+word_cors
+
+#Using this outpout format, we can find words most correlated with a word like "washer" using filter
+#Visualising correlations and clusters of words
+word_cors %>%
+  filter(item1 %in% c("washer", "screen", "sq", "distance", "fans", "air", "guest")) %>%
+  group_by(item1) %>%
+  top_n(7) %>%
+  ungroup() %>%
+  mutate(item2 = reorder(item2, correlation)) %>%
+  ggplot(aes(item2, correlation)) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~ item1, scales = "free") +
+  coord_flip() +labs(x="Correlation value", y="Word", title="Visualising correlation with dominant words")
+
+#word_cors %>%
+#  filter(correlation >.5) %>%   
+#  graph_from_data_frame() %>%
+#  ggraph(layout = "fr") +
+#  geom_edge_link(aes(edge_alpha = correlation)) +
+#  geom_node_point(color = "lightblue", size = 3) +
+#  geom_node_text(aes(label = name), repel = TRUE) +
+#  ggtitle('Word Network in Airbnb Listing Description') +
+#  theme_void()
+
+
+```
+
+
+```{r trigrams}
+#It may also be interesting to see trigrams
+review_trigrams <- unique_listing_ids_with_reviews %>%
+  unnest_tokens(trigram, description, token = "ngrams", n = 3)
+
+trigrams_separated <- review_trigrams %>%
+  separate(trigram, c("word1", "word2", "word3"), sep = " ")
+
+trigrams_filtered <- trigrams_separated %>%
+  filter(!word1 %in% stop_words$word) %>%
+  filter(!word2 %in% stop_words$word) %>%
+  filter(!word3 %in% stop_words$word) %>%
+  filter(word1 != "br", word2 !="br")
+
+trigram_counts <- trigrams_filtered %>%
+  count(word1, word2, word3, sort = TRUE)
+
+trigrams_united <- trigrams_filtered %>%
+  unite(trigram, word1, word2, word3, sep = " ")
+
+trigrams_united %>%
+  count(trigram, sort = TRUE)
+
+trigrams_united
+
+#The most common combination of trigram words are king size bed, flat screen tv, queen size bed and so on.
+
+```
+
+#### 2.2.3 Variables that can be extracted from the text that is related with the rating score.
+
+* Using the textual description of the property supplied by the owner, and its relation with the
+price that the property is listed for rent.
+
+```{r analyse_rating_categories }
+rating_categories <- tidy_listing %>%
+  group_by(listing_id) %>%
+  summarise(avg_rating = mean(review_scores_rating)) %>%
+  ungroup()
+
+# Lets find the levels that we want to aggregate the words
+quantile(rating_categories$avg_rating,na.rm = T)
+
+# now assign them in a rating group
+
+rating_categories$rating_category <- ifelse(rating_categories$avg_rating<99,1,2)
+
+ratings_categories_tokens <- tidy_listing %>% left_join(rating_categories) %>%
+  group_by(rating_category,word) %>% summarise(total =sum(n))
+
+ratings_categories_tokens %>% filter(rating_category==1) %>% arrange(desc(total)) %>% top_n(10)
+
+ratings_categories_tokens %>% filter(rating_category==2) %>% arrange(desc(total)) %>% top_n(10)
+
+```
+
+##### 2.2.3.1 Impact of readability on price
+
+Using the textual description of the property supplied by the owner, how does this relate with the
+price that the property is listed for rent?
+```{r splitting_chunks_for_readability, eval=FALSE}
+listings_for_readability <- listings_to_analyse %>% select(listing_id,description,price) %>%
+  unique(.)
+
+readability_all <- data.frame()
+
+for(i in 1:nrow(listings_for_readability)){
+#for(i in 1:100){
+
+  readability_h <- data.frame()
+
+  this_text <- iconv(listings_for_readability$description[i])
+  this_text <- removeNumbers(this_text)
+  this_text <- removePunctuation(this_text)
+
+  #to avoid that the flesch_kincaid stops processing, we implement tryCatch and catch the errors without interuption of the code
+  tryCatch(readability_h <- flesch_kincaid(this_text),error=function(e){
+    cat("Error parsing")
+  })
+
+  if(!is.null(readability_h$Readability)){
+
+     readability_h <- readability_h$Readability
+     readability_h$listing_id <- listings_for_readability$listing_id[i]
+     readability_all <- bind_rows(readability_all,readability_h)
+   }
+
+  print(i)
+}
+
+listings_readability <- readability_all %>% left_join(listings_for_readability)
+```
+```{r eval = FALSE, echo=FALSE}
+saveRDS(listings_readability, "listings_readability.rds")
+```
+
+```{r read_listings_readability, echo=FALSE}
+listings_readability <- readRDS("listings_readability.rds")
+```
+
+
+##### 2.2.3.2 Models for readability
+
+```{r listings_readability_reg}
+read_model1 <- lm(listings_readability$price~listings_readability$FK_grd.lvl)
+read_model2 <- lm(listings_readability$price~listings_readability$FK_read.ease)
+read_model3 <- lm(listings_readability$price~listings_readability$syllable.count)
+read_model4 <- lm(listings_readability$price~listings_readability$sentence.count)
+read_model5 <- lm(listings_readability$price~listings_readability$word.count)
+
+summary(read_model1)
+summary(read_model2)
+summary(read_model3)
+summary(read_model4)
+summary(read_model5)
+```
+
+##### 2.2.3.3 Formality
+
+```{r formality_listing, eval=FALSE}
+listings_to_analyse <- unique_listing_ids_with_reviews
+listings_to_analyse$description <- iconv(listings_to_analyse$description)
+
+formality_listing <- listings_to_analyse %>% mutate(na_filter = is.na(listings_to_analyse$description)) %>% filter(na_filter == FALSE)
+
+
+formality_listing_qdap <- qdap::formality(formality_listing$description, formality_listing$listing_id)
+
+formality_listing_df <- formality_listing_qdap$formality
+formality_listing_df <- formality_listing_df %>% mutate(listing_id = as.numeric(listing_id))
+
+formality_listing <- formality_listing %>% left_join(formality_listing_df)
+```
+
+```{r eval=FALSE}
+saveRDS(formality_listing, "listing_formality.rds")
+```
+
+```{r}
+formality_listing <- readRDS("listing_formality.rds")
+```
+
+
+```{r reg_models_listing}
+model1 <- lm(formality_listing$price ~formality_listing$formality)
+model2 <- lm(formality_listing$price ~formality_listing$word.count)
+model3 <- lm(formality_listing$review_scores_rating ~formality_listing$word.count)
+model4 <- lm(formality_listing$review_scores_rating ~formality_listing$word.count)
+
+
+summary(model1)
+summary(model2)
+summary(model3)
+summary(model4)
+
+
+
+#stargazer::stargazer(model1, model2)
+```
+
+
+##### 2.2.3.4 Formality of Reviews
+
+```{r formality_reviews, eval = FALSE}
+#splitting reviews into smaller chunks
+reviews_for_readability <- reviews %>% select(listing_id,id, comments) %>%
+  unique(.)
+
+reviews_for_formality <- reviews_for_readability
+reviews_for_formality$comments <- iconv(reviews_for_formality$comments)
+reviews_for_formality$comments <- iconv(reviews_for_formality$comments)
+reviews_for_formality$comments <- removeNumbers(reviews_for_formality$comments)
+reviews_for_formality$comments <- removePunctuation(reviews_for_formality$comments)
+
+formality_reviews <- reviews_for_formality %>% mutate(na_filter = is.na(comments)) %>% filter(na_filter == FALSE)
+
+total_number_of_rows <- nrow(formality_reviews)
+
+split_size <- 1000
+local_counter <- 0
+this_chunk <- data.frame()
+
+total_number_of_chunks <- total_number_of_rows/split_size
+start_row <- 1
+this_start_row <- NA
+this_last_row <- NA
+
+for(i in 1:total_number_of_chunks){
+  if(i ==1){
+    this_start_row <- start_row
+  }
+  else {
+    this_start_row <- (i-1)*split_size+1
+  }
+
+  this_last_row <- i*split_size
+  chunk_here <- formality_reviews[this_start_row:this_last_row,]
+  this_chunk_name <- paste0("chunk_",i,".rds")
+  saveRDS(chunk_here,file=paste0("input_splitted/",this_chunk_name))
+}
+
+```
+
+
+##### 2.2.3.5 Process Formality Parallel in Different Jobs on RStudio Cloud
+
+```{r process_formality_chunk, eval=FALSE}
+library(dplyr)
+library(qdap)
+
+all_chunks <- list.files("input_splitted/",full.names = T)
+total_chunks <- length(all_chunks)
+
+
+for(i in 1:total_chunks){
+
+  this_random_chunk_index <- sample(1:total_chunks,1)
+  this_chunk_file <- all_chunks[this_random_chunk_index]
+  # Checking first if this file already exists
+  # if it exists then skip
+  output_file <- gsub("input","output",this_chunk_file)
+  if(file.exists(output_file)){
+    print(paste0("File ",output_file," is already there...skipping"))
+    next
+  }
+  formality_reviews <- readRDS(this_chunk_file)
+  print(paste0("Processing for chunk: ",this_chunk_file))
+
+  # We got the random chunk to work with
+  # Lets do something
+
+  formality_reviews <- qdap::formality(formality_reviews$comments, formality_reviews$id)
+
+  formality_reviews_df <- formality_reviews$formality
+  formality_reviews_df <- formality_reviews_df  %>% mutate(id = as.numeric(id))
+
+  chunk_here <- formality_reviews_df
+  #chunk_here$language <- textcat(iconv(chunk_here$comments))
+
+  # Ok now we did anything we wanted to do
+  # lets save it
+
+  saveRDS(chunk_here,file=output_file)
+}
+
+```
+
+```{r combining_chunks, eval=FALSE}
+#binding the resulting chunks into an single file
+
+all_output_chunks <- list.files("Hawaii_Processing/output_splitted/",full.names = T)
+
+formality_output_chunks <- lapply(all_output_chunks, readRDS)
+
+formality_combined <- data.table:: rbindlist(formality_output_chunks)
+
+formality_reviews_df <- formality_combined  %>% mutate(id = as.numeric(id))
+
+formality_reviews_df <- reviews %>% left_join(formality_reviews_df)
+
+saveRDS(formality_reviews_df, "formality_reviews_df.rds")
+```
+
+```{r read_formality_reviews_df, eval=TRUE}
+formality_reviews_df <- readRDS("formality_reviews_df.rds")
+```
+
+
+##### 2.2.3.6 Readability all reviews
+```{r readability_reviews, eval =FALSE}
+library(stringr)
+library(tm)
+library(qdap)
+library(wordcloud)
+
+#reviews <- readRDS("../Appendix_Files/reviews_cleaned.rds")
+
+
+#### Readability on reviews
+
+reviews_for_readability <- reviews %>% select(listing_id,id, comments) %>%
+  unique(.)
+
+readability_all_reviews <- data.frame()
+
+for(i in 1:nrow(reviews_for_readability)){
+  #for(i in 1:100){
+  readability_h <- data.frame()
+
+  this_text <- iconv(reviews_for_readability$comments[i])
+  this_text <- removeNumbers(this_text)
+  this_text <- removePunctuation(this_text)
+
+  tryCatch(readability_h <- flesch_kincaid(this_text),error=function(e){
+    cat("Error parsing")
+  })
+
+  if(!is.null(readability_h$Readability)){
+
+    readability_h <- readability_h$Readability
+    readability_h$listing_id <- reviews_for_readability$listing_id[i]
+    readability_all_reviews <- bind_rows(readability_all_reviews,readability_h)
+  }
+
+  print(i)
+}
+
+saveRDS(readability_all_reviews, "readability_all_reviews.rds")
+```
+
+```{r read_readability_reviews}
+readability_all_reviews <- readRDS("readability_all_reviews.rds")
+```
+
+
+##### 2.2.3.7 Regression Models for Reviews
+
+```{r eval = TRUE}
+#regression models on reviews for formality and readability
+
+#### read in combined output of formality processing and join with listings
+
+reviews_formality <- readRDS("formality_reviews_df.rds")
+reviews_formality <- reviews_formality %>% left_join(listings, by = c("listing_id" = "id"))
+
+####models on formality
+formality_reviews_model1 <- lm(review_scores_value ~ formality, data = reviews_formality)
+summary(formality_reviews_model1)
+
+
+formality_reviews_model2 <- lm(price ~ formality, data = reviews_formality)
+summary(formality_reviews_model2)
+
+reviews_readability <- readRDS("readability_all_reviews.rds")
+reviews_readability <- reviews_readability %>% left_join(listings, by = c("listing_id" = "id"))
+
+readability_reviews_model1 <- lm(review_scores_value ~ FK_grd.lvl, data = reviews_readability)
+
+readability_reviews_model2 <- lm(review_scores_value ~ FK_read.ease, data = reviews_readability)
+
+readability_reviews_model3 <- lm(review_scores_value ~ word.count, data = reviews_readability)
+
+readability_reviews_model4 <- lm(review_scores_value ~ syllable.count, data = reviews_readability)
+
+readability_reviews_model5 <- lm(review_scores_value ~ sentence.count, data = reviews_readability)
+
+readability_reviews_model6 <- lm(review_scores_value ~ FK_grd.lvl + FK_read.ease + word.count +syllable.count + sentence.count  , data = reviews_readability)
+
+summary(readability_reviews_model1)
+
+combined_reg_df <- reviews_formality %>% select(listing_id, formality) %>%  left_join(reviews_readability, by = c("listing_id"))
+
+###combining readability and formality
+combinded_readability_formality_reviews_model1 <- lm(review_scores_value ~ formality + FK_grd.lvl , data = combined_reg_df)
+summary(combinded_readability_formality_reviews_model1)
+
+#leaps_subset_models <- leaps::regsubsets(review_scores_value ~. , data = combined_reg_df)
+#summary(leaps_subset_models)
+
+```
+
+
+##### 2.2.3.8 Is mentioning the name of the owner important?
+
+```{r}
+host_mentioning_df <- reviews %>% mutate(review_id = id) %>% left_join(listings, by = c("listing_id" = "id")) %>% mutate(host_name = removePunctuation(host_name)) %>%  select(comments, host_name, review_scores_rating, price) %>% mutate(host_name_mentioned = stringr::str_detect(tolower(comments), tolower(host_name)))
+
+```
+
+This way of identifying the host names has some limitations such as nicknames. If the host_name is the full name and the reviewers call them by their nickname (e.g. Edward and Ed), the grepl will not identify that the host was mentioned.
+
+comments                                                                                                 host_name host_name_mention~
+ 7 "Our Hale Koa Studio was a great find. \r\nIt was clean, and when we needed help or had a questions, Ge~ Edward                     1
+ 8 "Ed made us feel very welcome. He answered any questions we had quickly and easily. It was a very nice ~ Edward                     0
+ 9 "Hale Kona Studio was a great vacation launch pad for our week on the Big Island.  It was clean and clo~ Edward                     0
+10 "Huge mahalo to Ed!\n\nWe spent 9 days in his charming studio. The location was great for us as it was ~ Edward                     0
+
+
+```{r}
+host_mentioning_df %>% filter(host_name_mentioned ==1) %>% head(10)
+```
+```{r}
+host_mentioning_df <- host_mentioning_df %>% mutate(host_name_mentioned = as.factor(host_name_mentioned)) %>% filter(!is.na(host_name_mentioned))
+
+host_mentioning_df %>% ggplot(aes(x=host_name_mentioned, review_scores_rating))+geom_boxplot()
+
+host_mentioning_df %>% ggplot(aes(fill=host_name_mentioned, review_scores_rating))+geom_histogram()
+
+```
+
+```{r}
+t.test(host_mentioning_df$review_scores_rating ~host_mentioning_df$host_name_mentioned)
+
+```
+
+The mean review score of the hosts that were mentioned by name was 95.52 and hence slightly higher than the mean of the hosts that were not mentioned by name 96.37. The difference is significant $p < 0.05$, which indicates that there is an impact mentioning the name on the review score. As mentioned above, the method of detecting the host name is limited to the exact spelling of the name and nicknames would not be detected. However, this result could have been impacted by outliers.
+
+```{r}
+t.test(host_mentioning_df$price ~host_mentioning_df$host_name_mentioned)
+
+```
+The mean of the hosts that were not mentioned is 197.10 USD while the mean of the host that were mentioned is  177.59 USD which is significantly higher $(p<0.05)$. This contradicts our expectation that the listings where the host name is mentioned are better and more expensive. However, mentioning the host name could also indicate that these hosts are closer to the guests, which is usually the case if the listing is a shared house, which would be offered at a lower rate than private apartments. Furthermore, hosts that are mentioned in the reviews seem to interact closer with their guests which could mean that they are hosting because they enjoy company and are not solely interested in profit.
+
+
+##### 2.2.3.9 Is mentioning the amenities important?
+
+```{r}
+amenities_mentioning_df <- host_mentioning_df %>% mutate(comments = tolower(comments)) %>%   mutate(Baking_sheet=stringr::str_detect(comments,"baking sheet"),Wifi=stringr::str_detect(comments,"wifi"),TV=stringr::str_detect(comments,"tv"),Oven=stringr::str_detect(comments,"oven"),Pool=stringr::str_detect(comments,"pool"),Refrigerator=stringr::str_detect(comments,"refrigerator"),Air_Condition=stringr::str_detect(comments,"air condition"),Iron=stringr::str_detect(comments,"iron"),Kitchen=stringr::str_detect(comments,"kitchen"),Garden=stringr::str_detect(comments,"garden"),Free_parking=stringr::str_detect(comments,"free parking"),Hot_tub=stringr::str_detect(comments,"hot tub"),Washing_machine=stringr::str_detect(comments,"washing machine"),Dryer=stringr::str_detect(comments,"dryer"),Heating=stringr::str_detect(comments,"heating"))
+```
+
+##### 2.2.3.10 Regression Models on Mentioning Amenities
+```{r}
+amenities_mentioning_price_df <- amenities_mentioning_df %>% select(-c(review_scores_rating, host_name, comments))
+
+model_amenities_mentioning_price <- lm(log(price)~.,data=amenities_mentioning_price_df)
+MASS::stepAIC(model_amenities_mentioning_price)
+```
+
+
+```{r}
+amenities_mentioning_rating_df <- amenities_mentioning_df %>% select(-c(price, host_name, comments))
+model_amenities_mentioning_rating <- lm(review_scores_rating~.,data=amenities_mentioning_rating_df)
+MASS::stepAIC(model_amenities_mentioning_rating)
+```
+
+
+
+
+## 3 Part B Sentiment
+The aim of part B was to understand how text derived features from the listing and = documents, relate to the price and rating variables. To do so the group computed the polarity on a document level and sentiment on a listing level.
+
+
+### 3.1 Data preparation
+```{r create_all_data_df}
+#Merge listing table and review table
+reviews_data <- reviews_data %>% rename(review_id = id)
+listings_data <- listings_data %>% rename(listing_id = id)
+
+all_data_df <- listings_data %>%
+  left_join(reviews_data)
+```
+
+When analysing the pricing aspect, we decided not to use the price variables but rather to take into account the price divided by the number of people that specific listing could accommodate, achieving therefore the price per person.
+```{r}
+all_listings <- all_data_df %>% dplyr::select(listing_id,description,price,accommodates) %>%
+  unique(.)
+
+#remove currency symbols
+listing_id_price <- all_listings %>%
+  dplyr::select(listing_id,price,accommodates) %>%
+  mutate(price = as.numeric(gsub("\\$","",price))) %>% na.omit()
+
+#calculate price per person
+listing_id_price$price_per_person <- (listing_id_price$price) / (listing_id_price$accommodates)
+
+#calculate average rating for each listing
+listing_id_avg_rating <- all_data_df %>%  
+  group_by(listing_id) %>%
+  summarise(avg_rating = mean(review_scores_rating)) %>% na.omit()
+```
+
+Let's look at the distribution of price and average rating. Most of the average price is distributed between $50 and $150. Most of the average rating for each listing_id is distributed between 88 to 100.
+```{r}
+#Plotting the price distribution
+ggplot(listing_id_price) + geom_histogram(aes(x=price_per_person)) + labs(title="Listing_id Count",x="Price",y="Frequency")
+
+#Plotting the rating distribution
+ggplot(listing_id_avg_rating) + geom_histogram(aes(x=avg_rating)) + labs(title="Listing_id Count",x="Average Rating",y="Frequency")
+```
+
+
+```{r}
+summary(listing_id_price$price_per_person)
+quantile(listing_id_price$price_per_person,seq(0,1,by=0.1))
+```
+
+```{r}
+summary(listing_id_avg_rating$avg_rating)
+quantile(listing_id_avg_rating$avg_rating,seq(0,1,by=0.1))
+```
+
+```{r}
+#Break the price into 5 sections
+z<- listing_id_price$price_per_person
+c0<-c(0,33,44,56,78,600)
+lables<-c('Super Low','Low','Median','High','Super High')
+listing_id_price <- listing_id_price %>% mutate(price_level = cut(z,c0,lables,right =TRUE,include.lowest = T))
+
+#Break the average rating into 5 sections
+z1<- listing_id_avg_rating$avg_rating
+c1<-c(0,92,96,98,99,100)
+listing_id_avg_rating <- listing_id_avg_rating %>% mutate(rating_level = cut(z1,c1,lables,right =TRUE,include.lowest = T))
+
+```
+
+### 3.2 Polarity analysis
+```{r detokenize}
+#detokenize
+reviews_detokens_all <- tidy_review %>%
+  group_by(listing_id) %>%
+  summarise(reviewText_nostopwords  = paste(word,collapse = "  "),  
+            totalwords = n())  %>% dplyr::select(listing_id, reviewText_nostopwords)
+
+reviews_detokens_all <- reviews_detokens_all %>% left_join(distinct(all_data_df %>% dplyr::select(listing_id, neighbourhood, neighbourhood_group_cleansed  )))
+```
+
+```{r}
+reviews_for_polarity <- reviews_detokens_all %>% left_join(listing_id_price) %>% left_join(listing_id_avg_rating)
+```
+
+```{r eval=FALSE}
+saveRDS(reviews_for_polarity, "reviews_for_polarity.rds")
+```
+
+```{r}
+reviews_for_polarity <- readRDS("reviews_for_polarity.rds")
+```
+
+
+```{r eval=FALSE}
+
+pol_all_review <- qdap::polarity(reviews_for_polarity$reviewText_nostopwords)
+pol_price <- qdap::polarity(reviews_for_polarity$reviewText_nostopwords,reviews_for_polarity$price_level)
+pol_rating <- qdap::polarity(reviews_for_polarity$reviewText_nostopwords,reviews_for_polarity$rating_level)
+
+```
+
+```{r eval=FALSE}
+saveRDS(pol_all_review, "pol_all_review.rds")
+saveRDS(pol_price, "pol_price.rds")
+saveRDS(pol_rating, "pol_rating.rds")
+
+```
+
+```{r eval=FALSE}
+pol_island <- qdap::polarity(reviews_for_polarity$reviewText_nostopwords,reviews_for_polarity$neighbourhood_group_cleansed)
+saveRDS(pol_island, "pol_island.rds")
+```
+
+```{r read_polarity_output, echo=FALSE}
+pol_all_review <- readRDS("pol_all_review.rds")
+pol_price <- readRDS("pol_price.rds")
+pol_rating <- readRDS("pol_rating.rds")
+pol_island <- readRDS("pol_island.rds")
+```
+
+```{r plotting polarity}
+#polarity for all reviews
+plot(pol_all_review)
+
+#polarity for different price levels
+plot(pol_price)
+
+#polarity for different rating levels
+plot(pol_rating)
+
+#polarity for different islands
+plot(pol_island)
+```
+
+Polarity is centered at 2 for all reviews which might be due to the many postive sentiments in the text.
+
+
+Conclusion: Hawaii is a great place.
+
+
+### 3.3 Sentiment analysis
+
+####3.3.1 Compute the sentiment on a listing level using comments
+Since we already have the tidy_review dataframe, compute the sentiment using the inner_join in tidytext pakage.
+```{r}
+# Bing Liu - Sentiment Dictionary
+tidy_review %>% inner_join(get_sentiments("bing")) %>%
+  count(sentiment,listing_id) %>%
+  pivot_wider(names_from = sentiment,values_from = n) %>%
+  replace_na(list(negative =0,positive=0))%>%    #replace NA with reasonable 0
+  mutate(bing_liu_sentiment = positive-negative) %>%
+  dplyr::select(listing_id,bing_liu_sentiment) -> bing_liu_sentiment_listing
+
+bing_liu_sentiment_listing <- bing_liu_sentiment_listing %>%
+  left_join(listing_id_price) %>%
+  left_join(listing_id_avg_rating)
+```
+
+```{r}
+# Afinn Dictionary
+tidy_review %>% inner_join(get_sentiments("afinn")) %>%
+  group_by(listing_id) %>%
+  summarise(sentiment_affin = sum(value)) -> sentiment_affin
+
+sentiment_affin <- sentiment_affin %>%
+  left_join(listing_id_price) %>%
+  left_join(listing_id_avg_rating)
+```
+
+```{r}
+# NRC Dictionary
+tidy_review %>% inner_join(get_sentiments("nrc")) %>%
+  count(sentiment,listing_id) %>%
+  pivot_wider(names_from = sentiment,values_from = n) %>%
+ replace_na(list(anticipation=0,joy=0,positive=0,surprise=0,trust=0,anger=0,disgust=0,fear=0,negative=0,sadness=0))%>%                           #replace NA with reasonable 0
+   mutate(sentiment_nrc = positive-negative) -> emotions_nrc
+
+emotions_nrc <- emotions_nrc %>%
+  left_join(listing_id_price) %>%
+  left_join(listing_id_avg_rating)
+```
+
+```{r}
+# Plot distribution of emotions
+tidy_review %>% inner_join(get_sentiments("nrc"),by ="word") %>%
+  count(sentiment,listing_id) %>% mutate(index = row_number()) %>% filter(!sentiment %in%c("positive", "negative")) %>%
+  ggplot(aes(x=reorder(sentiment,n), y=n, color=sentiment)) %>%
+  + geom_col() + labs(title="Sentiments Count\n(classification by emotion)",x="Sentiment Categories",y="Frequency")
+```
+
+```{r}
+#Bind the sentiment results together
+all_together_sentiments <- bing_liu_sentiment_listing %>%
+  left_join(sentiment_affin) %>%
+  left_join(emotions_nrc) %>%
+  ungroup() %>%
+  mutate(index = row_number()) %>%
+  na.omit()
+```
+
+
+To understand the most common positive and negative words in the reviews, we apply these 3 dictionaries above on sentiment analysis.
+```{r}
+#bing_liu Dictionary
+bing_word_counts <-  tidy_review %>%
+  inner_join(get_sentiments("bing")) %>% ungroup()  %>% count(word, sentiment, sort = TRUE)
+
+
+bing_word_counts %>%
+  mutate(word = reorder(word, n)) %>% group_by(sentiment) %>% top_n(10) %>%
+  ggplot(aes(word, n, fill = sentiment)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~sentiment, scales = "free") +
+  labs(y = "Contribution to sentiment", x = NULL) +
+  coord_flip() +
+  ggtitle('Words that contribute to positive and negative sentiment in the reviews')
+```
+
+```{r}
+#afinn
+afinn_word_counts <-  tidy_review %>%
+  inner_join(get_sentiments("afinn")) %>% ungroup()  %>% mutate(sentiment = ifelse(value>0,"positive","negative")) %>% count(word, sentiment, sort = TRUE)
+
+afinn_word_counts %>%
+  mutate(word = reorder(word, n)) %>% group_by(sentiment) %>% top_n(10) %>%
+  ggplot(aes(word, n, fill = sentiment)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~sentiment, scales = "free") +
+  labs(y = "Contribution to sentiment", x = NULL) +
+  coord_flip() +
+  ggtitle('Words that contribute to positive and negative sentiment in the reviews')
+```
+
+
+The most common negative words are 'noisy', 'loud'.
+
+
+Break the price and average rating score into 5 sections to understand sentiments in the reviews for each level.
+```{r}
+#plot the sentiment
+ggplot(all_together_sentiments,aes(x=index,y=bing_liu_sentiment, fill=price_level)) + geom_col(show.legend = FALSE)  + facet_wrap(~price_level) + labs(title= "Sentiment distribution for different price levels" )
+
+#plot the sentiment
+ ggplot(all_together_sentiments) + geom_col(show.legend = FALSE,aes(x=index,y=bing_liu_sentiment, fill=rating_level)) + facet_wrap(~rating_level)+labs(title= "Sentiment distribution for different rating levels" )
+```
+
+
+#### 3.3.2  Analysis from word prospective
+Let's look at the most common positive and negative words in the reviews for each level.
+```{r}
+#by rating level
+#afinn Dictionary
+afinn_word_counts2 <- tidy_review %>%
+  inner_join(get_sentiments("afinn")) %>% left_join(listing_id_avg_rating) %>%  ungroup()  %>% mutate(sentiment = ifelse(value>0,"positive","negative")) %>% count(word, sentiment, rating_level,sort = TRUE) %>% na.omit()
+
+afinn_word_counts2 %>%
+  mutate(word = reorder(word, n)) %>% group_by(sentiment,rating_level) %>% top_n(10) %>%
+  ggplot(aes(word, n, fill = sentiment)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~sentiment, scales = "free") +
+  labs(y = "Contribution to sentiment", x = NULL) +
+  coord_flip() + facet_wrap(~rating_level,scales="free") +
+  ggtitle('Words that contribute to positive and negative sentiment in the reviews in term of ratings')
+
+
+#bing liu
+bing_word_counts2 <- tidy_review %>%
+  inner_join(get_sentiments("bing")) %>% ungroup() %>% left_join(listing_id_avg_rating)   %>% count(word, sentiment, rating_level,sort = TRUE) %>% na.omit()
+
+bing_word_counts2 %>%
+  mutate(word = reorder(word, n)) %>% group_by(sentiment,rating_level) %>% top_n(10) %>%
+  ggplot(aes(word, n, fill = sentiment)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~sentiment, scales = "free") +
+  labs(y = "Contribution to sentiment", x = NULL) +
+  coord_flip() + facet_wrap(~rating_level,scales="free") +
+  ggtitle('Words that contribute to positive and negative sentiment in the reviews in term of ratings')
+
+#NRC Dictionary
+nrc_word_counts2 <- tidy_review %>%
+  inner_join(get_sentiments("afinn")) %>% left_join(listing_id_avg_rating) %>%  ungroup()  %>% mutate(sentiment = ifelse(value>0,"positive","negative")) %>% count(word, sentiment, rating_level,sort = TRUE) %>% na.omit()
+
+nrc_word_counts2 %>%
+  mutate(word = reorder(word, n)) %>% group_by(sentiment,rating_level) %>% top_n(10) %>%
+  ggplot(aes(word, n, fill = sentiment)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~sentiment, scales = "free") +
+  labs(y = "Contribution to sentiment", x = NULL) +
+  coord_flip() + facet_wrap(~rating_level,scales="free") +
+  ggtitle('Words that contribute to positive and negative sentiment in the reviews in term of ratings')
+```
+
+
+Dirty is common in the class with super low rating. Noisy is common in all levels except for the super high level.
+
+```{r}
+#by price level
+#afinn Dictionary
+afinn_word_counts3 <- tidy_review %>%
+  inner_join(get_sentiments("afinn")) %>% left_join(listing_id_price) %>%  ungroup()  %>% mutate(sentiment = ifelse(value>0,"positive","negative")) %>% count(word, sentiment, price_level,sort = TRUE) %>% na.omit()
+
+afinn_word_counts3 %>%
+  mutate(word = reorder(word, n)) %>% group_by(sentiment,price_level) %>% top_n(10) %>%
+  ggplot(aes(word, n, fill = sentiment)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~sentiment, scales = "free") +
+  labs(y = "Contribution to sentiment", x = NULL) +
+  coord_flip() + facet_wrap(~price_level,scales="free") +
+  ggtitle('Words that contribute to positive and negative sentiment in the reviews in term of price')
+
+#Bing liu Dictionary
+bing_word_counts3 <- tidy_review %>%
+  inner_join(get_sentiments("bing")) %>% ungroup() %>% left_join(listing_id_price)   %>% count(word, sentiment, price_level,sort = TRUE) %>% na.omit()
+
+bing_word_counts3 %>%
+  mutate(word = reorder(word, n)) %>% group_by(sentiment,price_level) %>% top_n(10) %>%
+  ggplot(aes(word, n, fill = sentiment)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~sentiment, scales = "free") +
+  labs(y = "Contribution to sentiment", x = NULL) +
+  coord_flip() + facet_wrap(~price_level,scales="free") +
+  ggtitle('Words that contribute to positive and negative sentiment in the reviews in term of price')
+
+
+#NRC Dictionary
+nrc_word_counts3 <- tidy_review %>%
+  inner_join(get_sentiments("afinn")) %>% left_join(listing_id_price) %>%  ungroup()  %>% mutate(sentiment = ifelse(value>0,"positive","negative")) %>% count(word, sentiment, price_level,sort = TRUE) %>% na.omit()
+
+nrc_word_counts3 %>%
+  mutate(word = reorder(word, n)) %>% group_by(sentiment,price_level) %>% top_n(10) %>%
+  ggplot(aes(word, n, fill = sentiment)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~sentiment, scales = "free") +
+  labs(y = "Contribution to sentiment", x = NULL) +
+  coord_flip() + facet_wrap(~price_level,scales="free") +
+  ggtitle('Words that contribute to positive and negative sentiment in the reviews in term of price')
+```
+
+
+### 3.4 Regression models
+In order to evaluate the predictability of individual ratings and prices against sentiments, the group decides to do linear regression model with single sentiment variables.
+
+#### 3.4.1 Regression using separate extracted sentiment variables
+
+##### 3.4.1.1 Regression based on sentiments from comments
+```{r}
+#Regression on price
+
+# Bing Liu
+modelB1 <- lm(log(price)~bing_liu_sentiment,
+             data=all_together_sentiments)
+
+# NRC affection
+modelB2 <- lm(log(price)~sentiment_nrc,
+             data=all_together_sentiments)
+
+#Afinn
+modelB3 <- lm(log(price)~sentiment_affin,
+             data=all_together_sentiments)
+
+stargazer::stargazer(modelB1,modelB2,modelB3,type = "text")
+```
+As is shown from the result, all these sentiment variables are significant.
+
+
+```{r}
+#Regression on rating
+
+# Bing Liu
+modelB4 <- lm(log(avg_rating)~bing_liu_sentiment,
+             data=all_together_sentiments)
+
+# NRC affection
+modelB5 <- lm(log(avg_rating)~sentiment_nrc,
+             data=all_together_sentiments)
+
+#Afinn
+modelB6 <- lm(log(avg_rating)~sentiment_affin,
+             data=all_together_sentiments)
+
+stargazer::stargazer(modelB4,modelB5,modelB6,type = "text")
+```
+As is shown in the results,  all these sentiment variables are significant.
+
+* Compute the sentiment on a listing level using descriptions.
+We have done sentiment analysis on customers' comments, and we want to look how it looks when doing the same thing with description from hosts. And this part has the same process as former one.
+
+##### 3.4.1.2 Regression based on sentiments from description
+```{r}
+# Bing Liu - Sentiment Dictionary
+tidy_listing %>% inner_join(get_sentiments("bing")) %>%
+  count(sentiment,listing_id) %>% pivot_wider(names_from = sentiment,values_from = n) %>%
+  replace_na(list(negative =0,positive=0))%>%
+  mutate(bing_liu_sentiment = positive-negative) %>%
+  dplyr::select(listing_id,bing_liu_sentiment) -> bing_liu_sentiment_listing_description
+
+bing_liu_sentiment_listing_description <- bing_liu_sentiment_listing_description %>%
+  left_join(listing_id_price) %>%
+  left_join(listing_id_avg_rating)
+```
+
+```{r}
+# Afinn Dictionary
+tidy_listing %>% inner_join(get_sentiments("afinn")) %>%
+  group_by(listing_id) %>%
+  summarise(sentiment_affin = sum(value)) -> sentiment_affin_description
+
+sentiment_affin_description <- sentiment_affin_description %>%
+  left_join(listing_id_price) %>%
+  left_join(listing_id_avg_rating)
+```
+
+Now, let's use the NRC dictionary to extract feelings.
+```{r}
+# NRC Dictionary
+tidy_listing %>% inner_join(get_sentiments("nrc")) %>%
+  count(sentiment,listing_id) %>%
+  pivot_wider(names_from = sentiment,values_from = n)%>% replace_na(list(anticipation=0,joy=0,positive=0,surprise=0,trust=0,anger=0,disgust=0,fear=0,negative=0,sadness=0))%>%
+   mutate(sentiment_nrc = positive-negative) -> emotions_nrc_description
+
+emotions_nrc_description <- emotions_nrc_description %>%
+  left_join(listing_id_price) %>%
+  left_join(listing_id_avg_rating)
+```
+
+
+```{r}
+#Bind the sentiment results together
+all_together_sentiments_description <- bing_liu_sentiment_listing_description %>%
+  left_join(sentiment_affin_description) %>%
+  #left_join(sentiments_loughran_description) %>%
+  left_join(emotions_nrc_description) %>%
+  na.omit()
+```
+
+
+
+```{r}
+## regression(price)
+
+# Bing Liu
+modelB7 <- lm(log(price)~bing_liu_sentiment,
+             data=all_together_sentiments_description)
+
+# NRC affection
+modelB8 <- lm(log(price)~sentiment_nrc,
+             data=all_together_sentiments_description)
+
+#Afinn
+modelB9 <- lm(log(price)~sentiment_affin,
+             data=all_together_sentiments_description)
+
+stargazer::stargazer(modelB7,modelB8,modelB9,type = "text")
+```
+
+
+```{r}
+## regression(rating)
+
+# Bing Liu
+modelB10 <- lm(log(avg_rating)~bing_liu_sentiment,
+             data=all_together_sentiments_description)
+
+# NRC affection
+modelB11 <- lm(log(avg_rating)~sentiment_nrc,
+             data=all_together_sentiments_description)
+
+#Afinn
+modelB12 <- lm(log(avg_rating)~sentiment_affin,
+             data=all_together_sentiments_description)
+
+
+stargazer::stargazer(modelB10,modelB11,modelB12,type = "text")
+```
+
+
+##### 3.4.1.3 Regression based on sentiments from syntactical features(? ! capital letters)
+* analyze syntactical features
+As for syntactical features, we the use of question mark, exclamation marks, and all capital letters in comments. Also, this follow the same path as former part.
+```{r}
+#add syntactical features(?, !, capital letter)
+all_data_df_new <- all_data_df%>%
+  mutate(with_question=as.numeric(stringr::str_detect(comments,"///?")),with_Exclamation=as.numeric(stringr::str_detect(comments,"!")), with_capital=as.numeric(stringr::str_detect(comments,"[[:upper:]]$")),
+         )
+
+#calculate average rate of question/Exclamation/capital for each listing
+
+  listing_id_avg_with_question <- all_data_df_new %>%
+  group_by(listing_id) %>%
+  summarise(avg_with_question = mean(with_question))
+
+  listing_id_avg_with_Exclamation <- all_data_df_new %>%
+  group_by(listing_id) %>%
+  summarise(avg_with_Exclamation = mean(with_Exclamation))
+
+
+  listing_id_avg_with_capital <- all_data_df_new %>%
+  group_by(listing_id) %>%
+  summarise(avg_with_capital = mean(with_capital))
+
+ #bind features together
+all_together_new <- listing_id_price%>%
+  left_join(listing_id_avg_rating)%>%
+  left_join(listing_id_avg_with_question)%>%
+  left_join(listing_id_avg_with_Exclamation)%>%
+  left_join(listing_id_avg_with_capital)%>%
+  dplyr::select(-rating_level,-price_level)%>%
+  na.omit()
+```
+
+In order to evaluate the predictability of individual ratings and prices against syntactical, the group decides to do linear regression model with single syntactical variables.
+```{r}
+#regression(price)
+## with_?
+modelB13 <- lm(log(price)~avg_with_question,
+             data=all_together_new)
+
+## with_!
+modelB14 <- lm(log(price)~avg_with_Exclamation,
+             data=all_together_new)
+
+##with_AAA
+modelB15<- lm(log(price)~avg_with_capital,
+             data=all_together_new)
+
+stargazer::stargazer(modelB13,modelB14,modelB15,type = "text")
+```
+
+```{r}
+#regression(rating)
+## with_?
+modelB17<- lm(log(avg_rating)~avg_with_question,
+             data=all_together_new)
+
+## with_!
+modelB18 <- lm(log(avg_rating)~avg_with_Exclamation,
+             data=all_together_new)
+
+##with_AAA
+modelB19 <- lm(log(avg_rating)~avg_with_capital,
+             data=all_together_new)
+
+stargazer::stargazer(modelB17,modelB18,modelB19,type = "text")
+```
+As is shown in the results, only review_with_exclamation_mark is significant.
+
+*After doing regression models using seperate variables, we then combine them all with other structured and unstructured variables to construct a more general and accurate model.
+
+##### 3.4.2 Regression based on all factors (both structured and unstructred variable)
+
+```{r separate amenities to different variables}
+# Data preparation
+all_data_df_amenities <- all_data_df %>% dplyr::mutate(Baking_sheet=stringr::str_detect(amenities,"Baking sheet"),Wifi=stringr::str_detect(amenities,"Wifi"),TV=stringr::str_detect(amenities,"TV"),Oven=stringr::str_detect(amenities,"Oven"),Pool=stringr::str_detect(amenities,"Pool"),Refrigerator=stringr::str_detect(amenities,"Refrigerator"),Air_Condition=stringr::str_detect(amenities,"Air Condition|Air Conditioning"),Iron=stringr::str_detect(amenities,"Iron"),Kitchen=stringr::str_detect(amenities,"Kitchen"),Garden=stringr::str_detect(amenities,"Garden"),Free_parking=stringr::str_detect(amenities,"Free parking"),Hot_tub=stringr::str_detect(amenities,"Hot tub"),Washing_machine=stringr::str_detect(amenities,"Washing machine"),Dryer=stringr::str_detect(amenities,"Dryer"),Heating=stringr::str_detect(amenities,"Heating"))
+```
+
+```{r deal with other variables except rating scores}
+listing_id_scores <- all_data_df_amenities %>%
+  group_by(listing_id) %>%
+  dplyr::select(host_response_time,
+         host_response_rate,
+         host_acceptance_rate,
+         host_is_superhost,
+         host_has_profile_pic,
+         host_identity_verified,
+         room_type,
+         property_type,
+         bathrooms_text,
+         bedrooms,
+         has_availability,
+         number_of_reviews ,
+         neighbourhood_group_cleansed,
+         Baking_sheet,Wifi,TV,Oven,Pool,Refrigerator,Air_Condition,Iron,Kitchen,Garden,Free_parking,Hot_tub,Washing_machine,Dryer,Heating)%>%
+  mutate(host_response_time=as.factor(host_response_time),
+         host_response_rate=as.numeric(gsub("\\%","",host_response_rate)),
+         host_acceptance_rate=as.numeric(gsub("\\%","",host_acceptance_rate)),
+         room_type=as.factor(room_type),
+         property_type=as.factor(property_type),
+         bathrooms_text=as.factor(bathrooms_text))%>%
+  unique()  
+
+
+listing_id_scores <-listing_id_scores%>%
+  replace_na(list(host_response_rate =mean(listing_id_scores$host_response_rate,na.rm=T),host_acceptance_rate =mean(listing_id_scores$host_acceptance_rate,na.rm=T),bedrooms =mean(listing_id_scores$bedrooms,na.rm=T)))%>%
+  na.omit()
+```
+
+```{r dealing with rating scores}
+listing_id_review_scores <- all_data_df %>%
+  group_by(listing_id) %>%
+summarise(  avg_accurary_rating = mean(review_scores_accuracy),
+            avg_cleanliness_rating =mean(review_scores_cleanliness),
+            avg_checkin_rating = mean(review_scores_checkin),
+            avg_communication_rating = mean(review_scores_communication),
+            avg_location_rating = mean(review_scores_location),
+            avg_location_value = mean(review_scores_value))%>%
+  na.omit()
+```
+
+
+```{r combine all variables we need}
+#without syntactical feature
+reg_all_data<-all_together_sentiments%>%
+  left_join(listing_id_scores)%>%
+  left_join(listing_id_review_scores)%>%
+  na.omit()
+```
+
+
+```{r deal with some problematic variables}
+
+reg_all_data$bathroom_shared<-stringr::str_detect(reg_all_data$bathrooms_text,"shared")
+reg_all_data%>%dplyr::select(-property_type,-bathrooms_text)->reg_all_data
+
+reg_all_data%>%dplyr::select(-anticipation,-joy,-positive,-surprise,-trust,-anger,-disgust,-fear,-negative,-sadness)->reg_all_data
+```
+
+```{r numeric variables standardization}
+#standardization
+reg_all_data$bing_liu_sentiment=scale(reg_all_data$bing_liu_sentiment)
+reg_all_data$accommodates=scale(reg_all_data$accommodates)
+reg_all_data$sentiment_affin=scale(reg_all_data$sentiment_affin)
+reg_all_data$sentiment_nrc=scale(reg_all_data$sentiment_nrc)
+reg_all_data$host_response_rate=scale(reg_all_data$host_response_rate)
+reg_all_data$host_acceptance_rate=scale(reg_all_data$host_acceptance_rate)
+reg_all_data$bedrooms=scale(reg_all_data$bedrooms)
+reg_all_data$number_of_reviews=scale(reg_all_data$number_of_reviews)
+reg_all_data$avg_accurary_rating=scale(reg_all_data$avg_accurary_rating)
+reg_all_data$avg_cleanliness_rating=scale(reg_all_data$avg_cleanliness_rating)
+reg_all_data$avg_checkin_rating=scale(reg_all_data$avg_checkin_rating)
+reg_all_data$avg_communication_rating=scale(reg_all_data$avg_communication_rating)
+reg_all_data$avg_location_rating=scale(reg_all_data$avg_location_rating)
+reg_all_data$avg_location_value=scale(reg_all_data$avg_location_value)
+reg_all_data<-reg_all_data%>%
+  left_join(listing_id_avg_with_Exclamation)%>%
+  na.omit()
+reg_all_data$avg_with_Exclamation=scale(reg_all_data$avg_with_Exclamation)
+
+reg_all_data<-reg_all_data%>%dplyr::select(-index)
+```
+
+After data preparation, we combine do regression using all variables. Here, we use stepAIC to simplify the model selection process.
+```{r }
+#regression using all variables against price
+reg_str_data_price_scaled<-reg_all_data%>%
+  dplyr::select(-avg_rating,-listing_id,-price_per_person)%>%
+  na.omit()
+
+model_all_price_scaled <- lm(log(price)~.,data=reg_str_data_price_scaled)
+MASS::stepAIC( model_all_price_scaled)
+```
+
+```{r}
+
+model_final_price_scaled<-lm(log(price) ~accommodates + sentiment_affin + sentiment_nrc +
+                               host_response_time + host_response_rate + host_acceptance_rate +
+                               host_is_superhost + host_has_profile_pic + room_type + bedrooms +
+                               has_availability + number_of_reviews + neighbourhood_group_cleansed +
+                               Baking_sheet + Wifi + TV + Oven + Refrigerator + Iron + Kitchen +
+                               Free_parking + Hot_tub + Dryer + Heating + avg_accurary_rating +
+                               avg_cleanliness_rating + avg_checkin_rating + avg_location_rating +
+                               avg_location_value + bathroom_shared+ avg_with_Exclamation, data = reg_str_data_price_scaled)
+summary(model_final_price_scaled)
+```
+
+```{r}
+
+#regression using all variables against rating
+reg_str_data_rating_scaled<-reg_all_data%>%
+  dplyr::select(-price,-listing_id,-price_per_person,-avg_accurary_rating,- avg_cleanliness_rating,- avg_checkin_rating,-avg_communication_rating,-avg_location_rating,-avg_location_value)%>%
+  na.omit()
+
+model_all_rating_scaled <- lm(log(avg_rating)~.,data=reg_str_data_rating_scaled)
+MASS::stepAIC( model_all_rating_scaled)
+```
+
+```{r}
+
+model_final_rating_scaled<-lm(log(avg_rating) ~bing_liu_sentiment + sentiment_nrc +
+                                host_response_time + host_response_rate + host_acceptance_rate +
+                                host_is_superhost + host_has_profile_pic + bedrooms + number_of_reviews +
+                                neighbourhood_group_cleansed + Baking_sheet + Oven + Pool +
+                                Iron + Kitchen + Free_parking + Hot_tub + Dryer + Heating +
+                                avg_with_Exclamation,
+                              data = reg_str_data_rating_scaled)
+summary(model_final_rating_scaled)
+```
+
+
+#### 3.4.3 Regression based on PCs extracted from all variables
+As model_final_price_scaled and model_final_rating_scaled used some highly correlated variables, we decided to use PCA method from package::psych to reduce dimensions and create variables that are uncorrelated. First, we clean data. Then, we do the PCA process. Also we rotate the PC to make it easier to explain. After creating 8 new variables, we did the regression model.
+```{r select numeric variables}
+## data cleaning
+factor_numeric_data<-reg_all_data%>%
+  dplyr::select(listing_id,price,bing_liu_sentiment,sentiment_affin,sentiment_nrc,number_of_reviews,avg_with_Exclamation,
+                host_response_rate,host_acceptance_rate,accommodates,bedrooms,avg_rating,
+                avg_accurary_rating,avg_cleanliness_rating,avg_checkin_rating,
+                avg_communication_rating,avg_location_rating,avg_location_value)
+
+```
+
+```{r change factor variables to ordered numeric}
+factor_nonnumeric_data<-reg_all_data%>%
+  transmute(listing_id=listing_id,
+            host_is_superhost=as.numeric(host_is_superhost),
+            host_has_profile_pic=as.numeric(host_has_profile_pic),
+            host_identity_verified=as.numeric(host_identity_verified),
+            has_availability=as.numeric(has_availability),
+            bathroom_shared=as.numeric(bathroom_shared),
+            Baking_sheet=as.numeric(Baking_sheet),
+            Wifi=as.numeric(Wifi),
+            TV=as.numeric(TV),
+            Pool=as.numeric(Pool),
+            Refrigerator=as.numeric(Refrigerator),
+            #Air_Condition=as.numeric(Air_Condition),
+            Iron=as.numeric(Iron),
+            Kitchen=as.numeric(Kitchen),
+            #  Garden=as.numeric(Garden),
+            Free_parking=as.numeric(Free_parking),
+            Hot_tub=as.numeric(Hot_tub),
+            # Washing_machine=as.numeric(Washing_machine),
+            Dryer=as.numeric(Dryer),
+            Heating=as.numeric(Heating)
+  )
+
+factor_nonnumeric_data<-factor_nonnumeric_data%>%
+  mutate(host_response_time=as.numeric(plyr::mapvalues(reg_all_data$host_response_time, c("N/A" ,"a few days or more","within a day" ,"within a few hours","within an hour"), c("0","1","2","3","4"))),
+         room_type=as.numeric(plyr::mapvalues(reg_all_data$room_type, c("Shared room",  "Private room","Hotel room","Entire home/apt"), c("1","2","3","4")))
+  )
+```
+
+```{r scale unscaled data}
+factor_nonnumeric_data_scaled<-factor_nonnumeric_data[,-1]%>%
+  scale()%>%
+  as.data.frame()%>%
+  mutate(listing_id=factor_nonnumeric_data$listing_id)
+```
+
+
+```{r bind variables together}
+reg_PCA_price<-factor_numeric_data%>%
+  left_join(factor_nonnumeric_data_scaled)%>%
+  dplyr::select(-listing_id,-avg_rating,-avg_accurary_rating,-avg_cleanliness_rating,-avg_checkin_rating,-avg_communication_rating,-avg_location_rating,-avg_location_value)
+```
+
+```{r}
+reg_PCA_rating<-factor_numeric_data%>%
+  left_join(factor_nonnumeric_data_scaled)%>%
+  dplyr::select(-price,-listing_id,-avg_accurary_rating,-avg_cleanliness_rating,-avg_checkin_rating,-avg_communication_rating,-avg_location_rating,-avg_location_value)
+```
+
+```{r reg_PCA_data}
+reg_PCA<-factor_numeric_data%>%
+  left_join(factor_nonnumeric_data_scaled)%>%
+  dplyr::select(-listing_id,-avg_accurary_rating,-avg_cleanliness_rating,-avg_checkin_rating,-avg_communication_rating,-avg_location_rating,-avg_location_value)
+```
+
+
+```{r Parallel Analysis Scree Plots to find the ideal factor number}
+##PCA
+psych::fa.parallel(reg_PCA_price[-1],fa="pc",show.legend=FALSE)
+```
+
+```{r do PCA_varimax8}
+(PCA<-principal(reg_PCA_price[-1],nfactors=8,rotate="varimax",scores=T))
+```
+
+```{r mutate PC variables}
+reg_PCA_final_data<-reg_PCA%>%
+  mutate(price=price,
+         RC1=0.97*bing_liu_sentiment+0.95*sentiment_affin+0.97*sentiment_nrc+0.90*number_of_reviews-0.14*accommodates+0.36*host_is_superhost-0.20*Pool+0.11*Refrigerator-0.12*Hot_tub+0.16*avg_with_Exclamation-0.1*Kitchen
+         ,
+         RC2=0.15*accommodates+0.15*Baking_sheet+0.63*Wifi+0.54*TV+0.32*Pool+0.40*Refrigerator+0.52*Iron+0.44 *Kitchen+0.22 *Hot_tub+0.56  *Dryer-0.1*Heating-0.15 *room_type-0.13*avg_with_Exclamation
+         ,
+         RC3=-0.10*number_of_reviews+0.87*accommodates+0.91*bedrooms-0.13*Pool+0.15* Kitchen+0.17*Free_parking+0.23*Dryer-0.14*room_type+0.1*host_identity_verified
+         ,
+         RC4=-0.12*host_acceptance_rate-0.15*accommodates+0.85*bathroom_shared+0.17*Wifi-0.35*TV -0.28*Pool-0.14*Iron-0.15*Kitchen-0.11*Hot_tub+0.84* room_type-0.11*avg_with_Exclamation-0.1*bedrooms
+         ,
+         RC5=0.81*host_response_rate+0.61*host_acceptance_rate+0.27*host_is_superhost+0.14*host_identity_verified-0.75*host_response_time
+         ,
+         RC6=-0.23*host_acceptance_rate+0.15*host_is_superhost+0.14*host_identity_verified-0.24*Baking_sheet+0.15*TV+0.55*Pool-0.28*Refrigerator+0.13*Iron-0.11*Kitchen+0.12*Free_parking+0.68* Hot_tub+0.22*Dryer +0.55*Heating+0.13*avg_with_Exclamation-0.11*host_response_time
+         ,
+
+         RC7= 0.12*bing_liu_sentiment+0.12*sentiment_affin+0.97*sentiment_nrc+0.49*avg_with_Exclamation+0.42*host_is_superhost-0.12*has_availability+0.60 *Baking_sheet-0.12*TV-0.18*Pool+0.22*Refrigerator+0.19 *Iron +0.24*Kitchen+0.51*Free_parking -0.13*Dryer+0.19*Heating
+
+         ,
+         RC8=0.1*host_acceptance_rate++0.65*host_has_profile_pic+0.40* host_identity_verified+0.64 *has_availability-0.12*Wifi+0.11*Pool +0.15*Refrigerator+0.12*Hot_tub
+  )
+```
+
+
+```{r reg_model_PCA_final_price}
+##regression
+model_PCA_final_price<-lm(formula = log(price) ~RC1+RC2+RC3+RC4+RC5+RC6+RC7+RC8, data = reg_PCA_final_data)
+summary(model_PCA_final_price)
+```
+
+
+```{r reg_model_PCA_final_price2}
+model_PCA_final_rating<-lm(formula = log(avg_rating) ~RC1+RC2+RC3+RC4+RC5+RC6+RC7+RC8, data = reg_PCA_final_data)
+summary(model_PCA_final_rating)
+```
+
+
+
+
+
+# 4. PART C Structural Topic Modelling (STM)
+
+## 4.1 STM on Reviews
+
+### 4.1.1 Ingest: Reading and processing text data
+
+```{r defining_reviews.df}
+reviews.df <- as.data.frame(postagged_reviews)
+reviews.df <- reviews.df%>% group_by(id) %>%summarise(documents_pos_tagged=paste(lemma, collapse=" "))
+
+subset_reviews <- postagged_reviews %>% select(id, review_scores_rating, price)
+
+reviews_new <- reviews.df %>% left_join(subset_reviews) %>% distinct(.)
+reviews_new <- reviews_new %>% na.omit(.)
+```
+
+### 4.1.2 Prepare: Associating Text with Metadata
+```{r eval = FALSE}
+##Pre-processing
+reviews_processed <- stm::textProcessor(reviews_new$documents_pos_tagged,
+                                   metadata = reviews_new,
+                                   lowercase = FALSE, #not required since this was done by unnest_tokens before
+                                   removestopwords = FALSE, #not required since we removed stopwords already
+                                   removenumbers = FALSE, #not required since we removed them already
+                                   removepunctuation = FALSE, #not required since we removed them already
+                                   ucp = FALSE,
+                                   stem = FALSE) #not required since the input data was already stemmed and lemmatized by the udpipe
+
+#Keep those words who appear more than 1% in the document corpus
+threshold_1 <- round(1/100 * length(reviews_processed$documents),0)
+
+out_1 <- prepDocuments(reviews_processed$documents,
+                     reviews_processed$vocab,
+                     reviews_processed$meta,
+                     lower.thresh = threshold_1)
+```
+
+```{r read_out_1, echo = FALSE}
+out_1 <- readRDS("out_1.rds")
+```
+
+```{r k0_stm, eval=FALSE}
+#Another approach to find optimal K is by setting K=0
+##Executing the Model
+hawaiifit_reviews_k0 <- stm(documents = out_1$documents,
+                vocab = out_1$vocab, K = 0,
+                prevalence =~ review_scores_rating+price, max.em.its = 75,
+                data = out_1$meta, reportevery=10,
+                # gamma.prior = "L1",
+                sigma.prior = 0.7,
+                init.type = "Spectral")
+```
+
+```{r hawaiifit_reviews_k0_read}
+hawaiifit_reviews_k0 <- readRDS("Hawaai_stm_0.rds")
+```
+
+```{r summary_hawaiifit, eval=TRUE}
+summary(hawaiifit_reviews_k0)
+```
+
+```{r run_numtopics, eval= FALSE}
+#Finding the optimal number of topics
+numtopics_30 <- stm::searchK(out_1$documents,out_1$vocab,
+                     K=seq(from=2, to=30, by=5))
+```
+
+```{r read_numtopics30, echo= FALSE}
+numtopics_30 <- readRDS("numtopics_30.rds")
+```
+
+```{r}
+#Plot the stm object to view the percentage of topics in the corpus for k=0
+plot(numtopics_30)
+```
+
+###4.1.3 Evaluate: Model selection for k=7
+```{r eval=FALSE}
+##Executing the Model
+hawaii_stm_reviews <- stm(documents = out_1$documents,
+                vocab = out_1$vocab, K = 7,
+                prevalence =~ review_scores_rating+price,
+                max.em.its = 75,
+                data = out_1$meta,
+                reportevery=10,
+                sigma.prior = 0.7,
+                init.type = "Spectral")
+```
+
+###4.1.4 Understand: Interpreting STM by plotting and inspecting result
+
+```{r read_hawaiifit_reviews, echo=FALSE, eval=TRUE}
+hawaii_stm_reviews <- readRDS("hawaii_stm_reviews.rds")
+```
+
+###4.1.5 Displaying words associated with topics
+```{r summary_hawaii_stm, eval=TRUE}
+# Summary of set of words describing each topic for k=7
+summary(hawaii_stm_reviews)
+```
+
+```{r plot_hawaii_stm, eval=TRUE}
+#Plot the stm object to view the percentage of topics in the corpus for k=7
+plot(hawaii_stm_reviews)
+```
+
+
+```{r stm_clouds, eval=TRUE}
+#Wordclouds for the 7 topics
+stm::cloud(hawaii_stm_reviews,topic = 1)
+stm::cloud(hawaii_stm_reviews,topic = 2)
+stm::cloud(hawaii_stm_reviews,topic = 3)
+stm::cloud(hawaii_stm_reviews,topic = 4)
+stm::cloud(hawaii_stm_reviews,topic = 5)
+stm::cloud(hawaii_stm_reviews,topic = 6)
+stm::cloud(hawaii_stm_reviews,topic = 7)
+```
+
+```{r eval=TRUE}
+#Extracting theta matrix from the fitted object
+convergence_theta_reviews <- as.data.frame(hawaii_stm_reviews$theta)
+
+colnames(convergence_theta_reviews) <- paste0("topic_",1:7)
+```
+
+###4.1.6 Plotting relationship between metadata and topics using estimateEffect()  
+```{r eval=FALSE}
+#Estimate regression using an STM object to incorporate measurement uncertainty from the STM model using the method of composition.
+price_rating_effect <- stm::estimateEffect(~review_scores_rating+price,
+                                      stmobj = hawaii_stm_reviews,
+                                      metadata = out_1$meta )
+
+topic_proportion <- colMeans(hawaii_stm_reviews$theta)
+```
+
+```{r save_price_rating_reviews, eval=FALSE, echo=FALSE}
+saveRDS(price_rating_effect, "price_rating_effect_reviews.rds")
+```
+
+```{r read_price_rating_reviews, echo=FALSE}
+price_rating_effect <- readRDS("price_rating_effect_reviews.rds")
+```
+
+
+```{r}
+#label the topics
+topic_labels <- c("positive feedback", "local attractions", "beach", "accessibility", "amenities", "comfortability", "host", "service")
+
+#Plot the effects for score rating
+plot(price_rating_effect, covariate = "review_scores_rating",
+     topics = c(1,2,3,4,5,6,7),
+     model = hawaii_stm_reviews, method = "difference",
+     cov.value1 = "100", cov.value2 = "0",
+     xlim = c(-0.010, 0.008),
+     xlab = "Low Rating ... High Rating",
+     main = "Marginal Effects of Score Rating",
+     ci.level = 0.05,
+     custom.labels =topic_labels,
+     labeltype = "custom")
+```
+
+
+```{r}
+#Plot the summary effects for price
+plot(price_rating_effect, covariate = "price",
+     topics = c(1:7),
+     model = hawaii_stm_reviews, method = "continuous",
+     cov.value1 = margin2, cov.value2 = margin1,
+     xlab = "Low Price ... High Price",
+     main = "Marginal Change on Topic Probabilities for Low and High Price",
+     custom.labels =topic_labels,
+     ci.level = 0.05,
+     labeltype = "custom")
+```
+
+
+###4.2 LDA on Reviews
+
+```{r}
+#filtering to retain only verbs, nouns and adjectives
+reviews_filtered <- postagged_reviews%>% filter(upos %in% c("VERB", "NOUN", "ADJ"))
+
+reviews_filtered <- reviews_filtered %>% select(doc_id, lemma,id, listing_id, reviewer_id, neighbourhood_group_cleansed, price, review_scores_rating)
+#casting dtm grouping the words by review id
+reviews_dtm <- reviews_filtered %>% count(id, lemma) %>% cast_dtm(id, lemma,n)
+
+reviews_sel_idx <- slam::row_sums(reviews_dtm) > 0
+reviews_dtm <- reviews_dtm[reviews_sel_idx, ]
+
+```
+
+```{r, eval=FALSE}
+#computing LDA model to obtain the details of the model fit outlining how words are associated to topics and how topics are associated to documents.
+LDA_reviews <- topicmodels::LDA(reviews_dtm, k=7, method="Gibbs", control = list(seed= 1234))
+```
+```{r loading_lda_reviews, echo=FALSE}
+LDA_reviews <- readRDS("LDA_reviews.rds")
+```
+
+
+```{r}
+#obtaining the per-word-per-topic probability, where the model computes the probability of a specific term being generated from a specific topic.
+topics_reviews <- tidy(LDA_reviews,matrix="beta")
+
+#obtaining the 10 most common terms per topic
+top_terms_reviews <- topics_reviews %>% group_by(topic) %>% top_n(10, beta) %>% ungroup() %>% arrange(topic, -beta)
+
+topic_labels_reviews <- c("Host service", "Accessibility", "Positive Feedback", "Beach", "Scenery", "Activities", "Accommodation")
+
+top_terms_reviews %>% mutate(term= reorder(term, beta), topic = factor(topic, labels = topic_labels_reviews)) %>% ggplot(aes(term, beta, fill=topic))+ geom_col()+ facet_wrap(~topic, scales="free")+ coord_flip() + labs(fill="Topic", y= "Term", x = "Beta")
+```
+
+```{r}
+topics_gamma_reviews <- tidy(LDA_reviews, matrix="gamma")
+topics_gamma_listing <- topics_gamma_reviews %>% arrange(document)
+
+topics_gamma_reviews %>% ggplot(., aes(gamma, fill=as.factor(topic))) + geom_histogram(alpha=0.5)+ facet_wrap(~topic, ncol=4)+ scale_y_log10() + labs(title= "Probability distribution per Review's topic", x= "Gamma", y= "Document's frequency")
+```
+
+
+###4.3 STM on Listing
+```{r}
+listing.df <- tidy_listing
+listing.df <- listing.df%>% group_by(listing_id) %>%summarise(lemma_description=paste(lemma, collapse=" "))
+subset_listing <- tidy_listing %>% select(room_type, neighbourhood_cleansed, price, listing_id, review_scores_rating)
+listing_new <- subset_listing %>% left_join(listing.df) %>% distinct(.)
+```
+
+```{r textprocessor_out, eval=FALSE}
+listings_processed <- textProcessor(listing_new$lemma_description,metadata = listing_new,                       lowercase = FALSE, #not required since this was done by unnest_tokens before
+                      removestopwords = FALSE, #not required since we removed stopwords already
+                      removenumbers = FALSE, #not required since we removed them already
+                      removepunctuation = FALSE, #not required since we removed them already
+                      ucp = FALSE,
+                      stem = FALSE) #not required since the input data was already stemmed
+
+                                    #
+limit <- round(1/100 * length(listings_processed$documents),0)
+
+out_2 <- prepDocuments(listings_processed$documents,
+                     listings_processed$vocab,
+                     listings_processed$meta,
+                     lower.thresh = limit)
+
+```
+```{r, echo=FALSE, eval=FALSE}
+saveRDS(out_2, "out_2.rds")
+```
+
+```{r read_out_2, echo=FALSE}
+out_2 <- readRDS("out_2.rds")
+
+```
+
+```{r, eval=FALSE}
+Hawaii_stm <- stm(documents = out_2$documents,
+                   vocab = out_2$vocab,
+                   K = 0,
+                   prevalence =~price+ review_scores_rating,
+                   max.em.its = 40,
+                   data = out_2$meta,
+                   reportevery=3,
+                   sigma.prior = 0.7,
+                   init.type = "Spectral")
+```
+
+```{r, eval=FALSE, echo=FALSE}
+saveRDS(Hawaii_stm, "Hawaii_stm_listings.rds")
+```
+
+```{r echo=FALSE}
+Hawaii_stm <- readRDS("Hawaii_stm_listings.rds")
+```
+
+```{r}
+summary(Hawaii_stm)
+```
+
+```{r, eval=FALSE}
+topics_hawaii <- colMeans(Hawaii_stm$theta)
+```
+
+```{r eval=FALSE}
+number_of_topics <- stm::searchK(out_2$documents, out_2$vocab,K=seq(from=2, to=10, by=1))
+plot(number_of_topics)
+```
+
+```{r wordcloud, eval=FALSE}
+# OPTIMUM NUMBER IS 8
+#PREVALENT WORDS PER LISTING'S TOPIC
+stm::cloud(Hawaii_stm,topic = 1)
+stm::cloud(Hawaii_stm,topic = 2)
+stm::cloud(Hawaii_stm,topic = 3)
+stm::cloud(Hawaii_stm,topic = 4)
+stm::cloud(Hawaii_stm,topic = 5)
+stm::cloud(Hawaii_stm,topic = 6)
+stm::cloud(Hawaii_stm,topic = 7)
+stm::cloud(Hawaii_stm,topic = 8)
+```
+
+```{r  eval=TRUE}
+hawaii_stm_listings <- Hawaii_stm
+
+#Extracting theta matrix from the fitted object
+convergence_theta_listings <- as.data.frame(hawaii_stm_listings$theta)
+
+colnames(convergence_theta_listings) <- paste0("topic_",1:8)
+```
+
+```{r eval=TRUE}
+#Estimate regression using an STM object to incorporate measurement uncertainty from the STM model using the method of composition.
+price_rating_effect_listing <- stm::estimateEffect(~review_scores_rating+price,
+                                      stmobj = hawaii_stm_listings,
+                                      metadata = out_2$meta )
+
+topic_proportion <- colMeans(hawaii_stm_listings$theta)
+```
+
+```{r save_price_rating_listing, eval=FALSE, echo=FALSE}
+saveRDS(price_rating_effect_listing, "price_rating_effect_reviews_listing.rds")
+```
+
+```{r read_price_rating_listing, echo=FALSE}
+price_rating_effect_listing <- readRDS("price_rating_effect_reviews_listing.rds")
+```
+
+
+```{r}
+#label the topics
+topic_labels <- c("Traveller", "Activities", "Positive Feedback", "Appliances", "Booking", "Service", "Accessability", "Beverages")
+
+#Plot the effects for score rating
+plot(price_rating_effect_listing, covariate = "review_scores_rating",
+     topics = c(1,2,3,4,5,6,7),
+     model = hawaii_stm_listings, method = "difference",
+     cov.value1 = "100", cov.value2 = "0",
+     xlim = c(-0.010, 0.008),
+     xlab = "Low Rating ... High Rating",
+     main = "Marginal Effects of Score Rating",
+     ci.level = 0.05,
+     custom.labels =topic_labels,
+     labeltype = "custom")
+```
+
+```{r}
+#Plot the summary effects for price
+plot(price_rating_effect_listing, covariate = "price",
+     topics = c(1:7),
+     model = hawaii_stm_listings, method = "continuous",
+     cov.value1 = margin2, cov.value2 = margin1,
+     xlab = "Low Price ... High Price",
+     main = "Marginal Change on Topic Probabilities for Low and High Price",
+     custom.labels =topic_labels,
+     ci.level = 0.05,
+     labeltype = "custom")
+```
+
+
+
+
+
+
+### 4.4 LDA on Listings
+
+```{r listing_dtm, eval=TRUE}
+subset_listing <- tidy_listing %>% select(lemma, listing_id, price, review_scores_rating, neighbourhood_group_cleansed)
+listing_dtm <- tidy_listing %>% count(listing_id, lemma) %>% cast_dtm(listing_id,lemma,n)
+listing_sel_idx <- slam::row_sums(listing_dtm) > 0
+listing_dtm <- listing_dtm[listing_sel_idx, ]
+```
+
+```{r eval=FALSE}
+#run LDA on listing
+LDA_listing <- topicmodels::LDA(listing_dtm, k=8, method="Gibbs", control=list(seed=1234))
+```
+```{r save_LDA_listing, eval=FALSE}
+saveRDS(LDA_listing, "LDA_listing.rds")
+```
+
+```{r read_LDA_listing, echo=FALSE}
+LDA_listing <- readRDS("LDA_listing.rds")
+```
+
+```{r plot_lda_listings}
+topics_listing <- tidy(LDA_listing, matrix="beta")
+top_terms_listing <- topics_listing %>% group_by(topic)%>% top_n(10,beta) %>% ungroup %>% arrange(topic,-beta)
+
+labels_lda_listing <- c("Reservation", "Activities", "Amenities", "Location", "Accessibility", "Accommodation", "Rooms", "Views")
+
+top_terms_listing %>% mutate(term=reorder(term, beta), topic=factor(topic, labels = labels_lda_listing)) %>% ggplot(aes(term, beta, fill=factor(topic)))+ geom_col()+ facet_wrap(~topic, scales="free")+ coord_flip() + labs(x="Prominent words per topic", y="Value of beta", title="Most promiment words per listing's topics", fill= "Topic")
+```
+```{r eval=TRUE}
+topics_gamma_listing <- tidy(LDA_listing, matrix="gamma")
+topics_gamma_listing <- topics_gamma_listing %>% arrange(document)
+
+topics_gamma_listing %>% ggplot(., aes(gamma, fill=as.factor(topic))) + geom_histogram(alpha=0.5)+ facet_wrap(~topic, ncol=4)+ scale_y_log10() + labs(title= "Probability distribution per listing topic", x= "Gamma", y= "Document's frequency")
+```
+
+###4.5 Additive predictability
+
+###4.5.1 Corpus level summaries using stargazer and topicCorr on Reviews
+```{r eval=TRUE}
+#using regression model to estimate additive predictability of REVIEWS topics on price and rating scores
+#creating a simple regression table with two side-by-side models – two Ordinary Least Squares (OLS) using the lm() functions.
+reviews_to_regress_topic <- cbind(out_1$meta, convergence_theta_reviews)
+
+reviews_model_topic_rating <- lm(review_scores_rating~ topic_1+topic_2+topic_3+topic_4+topic_5+topic_6+topic_7,
+                         data = reviews_to_regress_topic)
+
+reviews_model_topic_price <- lm(price~ topic_1+topic_2+topic_3+topic_4+topic_5+topic_6+topic_7,
+                        data = reviews_to_regress_topic)
+
+#Run stargazer and carry out labelling adjustment
+stargazer(reviews_model_topic_rating, reviews_model_topic_price,
+          title="Regression Results",
+          align=TRUE,
+          type="text",
+          covariate.labels = c("positive feedback", "environment", "beach", "amenities", "accomodation", "comfortability", "service","recommendation", "communication", "location"),
+          omit.stat=c("LL","ser","f"))
+```
+
+```{r eval=FALSE}
+topicCorr_review <- plot(stm::topicCorr(hawaii_stm_reviews), method=c("simple"), verbose=TRUE, vlabels = topic_labels)
+```
+
+###4.5.2 Corpus level summaries using stargazer and topicCorr on Listings
+```{r eval=TRUE}
+#using regression model to estimate additive predictability of LISTINGS topics on price and rating scores
+#creating a simple regression table with two side-by-side models – two Ordinary Least Squares (OLS) using the lm() functions.
+listing_to_regress_topic <- cbind(out_2$meta, convergence_theta_listings)
+
+listing_model_topic_rating <- lm(review_scores_rating~ topic_1+topic_2+topic_3+topic_4+topic_5+topic_6+topic_7+topic_8,
+                         data = listing_to_regress_topic)
+
+listing_model_topic_price <- lm(price~ topic_1+topic_2+topic_3+topic_4+topic_5+topic_6+topic_7+topic_8,
+                        data = listing_to_regress_topic)
+
+#Run stargazer and carry out labelling adjustment
+stargazer(listing_model_topic_rating, listing_model_topic_price,
+          title="Regression Results",
+          align=TRUE,
+          type="text",
+          #dep.var.labels = c("Rate Rating", "Price Rating"),
+          covariate.labels = c("positive feedback", "environment", "beach", "amenities", "accomodation", "comfortability", "service","recommendation", "communication", "location"),
+          omit.stat=c("LL","ser","f"))
+```
+
+```{r eval=TRUE}
+plot(stm::topicCorr(hawaii_stm_listings), method=c("simple"), verbose=TRUE, vlabels = topic_labels)
+```
