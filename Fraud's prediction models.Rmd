@@ -1,0 +1,639 @@
+---
+title: "Fraud's prediction model"
+author: "Daniel Tedeschi Samaia"
+date: "09/12/2020"
+output:
+  html_document:
+    df_print: paged
+    toc: yes
+  pdf_document:
+    number_sections: yes
+    toc: yes
+header-includes: \usepackage{hyperref}
+always_allow_html: yes
+---
+\newpage
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+__Import necessary libraries__ 
+```{r  message=FALSE, eval = FALSE}
+library(dplyr)
+library(ggplot2)
+library(tidyverse)
+library(FSelector)  
+library(e1071)
+library(caTools)
+library(vctrs)
+library(ROSE)
+library(caret)
+library(randomForest)
+library(pROC) 
+library(partykit)
+library(CustomerScoringMetrics)
+library(plyr)
+library(tree)
+library(MASS)
+```
+
+
+__Read the CSV files__
+```{r  message=FALSE, eval = FALSE}
+
+#data to be used in models later
+datasmall <- read_csv("datafile_small.csv")
+
+data <- read_csv("datafile_full.csv")
+
+#We tested models that are more time consuming on a smaller dataset
+```
+
+\newpage
+
+# Data Preparation
+
+```{r  message=FALSE, eval = FALSE}
+
+#convert target into factor
+data$target <- as.factor(data$target)
+
+#Check levels of the target variable
+levels(data$target)
+
+#remove id
+data$ID_code <- NULL
+
+#remove na
+data <- na.omit(data)
+
+#Repeat the same with small dataset
+datasmall$target <- as.factor(datasmall$target)
+
+#Check levels of the target variable
+levels(datasmall$target)
+
+#remove id
+datasmall$ID_code <- NULL
+
+#remove na
+datasmall <- na.omit(datasmall)
+```
+
+
+## Apply Stratified Sampling
+```{r  message=FALSE, eval = FALSE}
+#Use stratified sampling for large dataset
+set.seed(10)
+stratified_data <- splitstackshape::stratified(data, "target", 0.7)
+```
+
+
+
+## Splitting
+```{r  message=FALSE, eval = FALSE}
+
+set.seed(123)
+
+# Split large stratified dataset into training and test sets
+split= caTools:: sample.split(stratified_data$target, SplitRatio =0.70)
+
+training_set = subset(stratified_data, split==TRUE)
+test_set =subset(stratified_data, split==FALSE)
+
+#Split small dataset into training and test sets
+split2= caTools:: sample.split(datasmall$target, SplitRatio =0.70)
+
+training_set_small = subset(datasmall, split2==TRUE)
+test_set_small =subset(datasmall, split2==FALSE)
+```
+
+\newpage
+
+# Code for Top 3 best performing models
+
+## Random Forest
+
+### Undersampling
+```{r  message=FALSE, eval = FALSE}
+#Apply undersampling to the large dataset to be used with Random Forest
+set.seed(123)
+undersample_data <- ROSE:: ovun.sample(target~. , data = training_set, method = "under",
+                                                                 p = 0.5, seed = 1)$data
+```
+
+### Selecting top 100 attributes based on their Information Gain
+```{r  message=FALSE, eval = FALSE}
+
+attribute_weights_under <- FSelector::information.gain(target~., undersample_data)
+attribute_weights_under <- attribute_weights_under %>% arrange(desc(attr_importance))
+selected_attribute_under <- FSelector:: cutoff.k(attribute_weights_under, 100)
+
+undersampledata <- undersample_data[selected_attribute_under]
+undersampledata$target=undersample_data$target
+```
+
+### Model
+```{r  message=FALSE, eval = FALSE}
+#Random Forest tuning
+training_features_under <- subset(undersampledata, select = -target)
+
+set.seed(111)
+tuneRF(training_features_under, undersampledata$target, mtryStart = 3, ntree = 500,
+       stepFactor = 1.5, improve = 0.01)
+
+RF_model_under<- randomForest(target~., undersampledata, mtry = 3, ntree = 500)
+
+prediction_RF_under<- predict(RF_model_under, test_set)
+
+(cf_random_under_70_100IG <- caret:: confusionMatrix(prediction_RF_under, 
+                 test_set$target, positive = '1', mode = "prec_recall"))
+```
+
+### Check RF for overfitting
+```{r  message=FALSE, eval = FALSE}
+prediction_RF_under_train <- predict(RF_model_under, training_set)
+
+(cf_random_under_70_100IG_train <- caret:: confusionMatrix(prediction_RF_under_train,
+                         training_set$target, positive = '1', mode = "prec_recall"))
+```
+
+## SVM
+
+### Oversampling
+```{r  message=FALSE, eval = FALSE}
+set.seed(123)
+
+oversample_data_70 <- ROSE:: ovun.sample(target~. , data = training_set_small,
+                                      method = "over", p = 0.5, seed = 1)$data
+```
+
+### Selecting all attributes with positive Information Gain
+```{r  message=FALSE, eval = FALSE}
+
+attribute_weights_over_70_pos <- FSelector:: information.gain(target~., oversample_data_70)
+
+selected_attribute_over_70_pos <- attribute_weights_over_70_pos
+%>% filter(attr_importance > 0) %>% 
+mutate(indexNames = row.names.data.frame(.)) %>% pull(., indexNames)
+
+oversample_data_all_70_pos <- oversample_data_70
+oversample_data_70_pos <- oversample_data_all_70_pos[selected_attribute_over_70_pos]
+oversample_data_70_pos$target <- oversample_data_all_70_pos$target
+```
+
+### Model
+```{r  message=FALSE, eval = FALSE}
+svm_model_over_linear_70_pos <- e1071:: svm(target~., data = oversample_data_70_pos,
+                                    kernel="linear", scale=TRUE, probability = TRUE)
+
+
+svm_prediction_over_linear_70_pos <- predict(svm_model_over_linear_70_pos, test_set_small)
+
+(cf_svm_over_linear_70_pos <- caret:: confusionMatrix(svm_prediction_over_linear_70_pos,
+                          test_set_small$target, positive = "1", mode = "prec_recall"))
+```
+
+### Check SVM for overfitting
+```{r  message=FALSE, eval = FALSE}
+svm_prediction_over_linear_70_pos_fitting <- predict(svm_model_over_linear_70_pos,          
+                                                           oversample_data_70_pos)
+
+(cf_svm_over_linear_70_pos_fitting <- caret::
+confusionMatrix(svm_prediction_over_linear_70_pos_fitting,
+oversample_data_70_pos$target, positive = "1", mode = "prec_recall"))
+```
+
+## LDA
+
+### Oversampling
+```{r  message=FALSE, eval = FALSE}
+
+set.seed(123)
+ov_training <- ovun.sample(target~., data = training_set_small, method = "over",
+                                                        p = .5, seed = 10)$data
+```
+
+### Model
+```{r  message=FALSE, eval = FALSE}
+
+lda_ov <- lda(target~., ov_training)
+predict_lda <- predict(lda_ov, test_set_small, type="class")$class
+(cf_lda_over_70=confusionMatrix(predict_lda, test_set_small$target,
+                                positive="1",mode="prec_recall"))
+```
+
+### Check LDA for overfitting
+```{r  message=FALSE, eval = FALSE}
+predict_lda_overfitting <- predict(lda_ov, ov_training, type="class")$class
+(cf_lda_over_70_fitting=confusionMatrix(predict_lda_overfitting, ov_training$target,
+                                                  positive="1",mode="prec_recall"))
+```
+
+\newpage
+
+# Plots for top 3 models
+
+## ROC plots
+```{r  message=FALSE, eval = FALSE}
+
+RF_model_under_prob=predict(RF_model_under, test_set, type ="prob")[,2]
+SVMpred <- predict(svm_model_over_linear_70_pos , test_set_small, probability = TRUE)
+SVM_prob <- attr(SVMpred, "probabilities")[,2]
+LDA_prob <- predict(lda_ov, test_set_small, type="prob")$posterior[,2]
+```
+
+```{r  message=FALSE, eval = FALSE}
+
+roc_RF=roc(test_set$target, RF_model_under_prob)
+roc_SVM <- roc(test_set_small$target, SVM_prob)
+roc_LDA <- roc(test_set_small$target, LDA_prob)
+
+
+df_RF = data.frame((1-roc_RF$specificities), roc_RF$sensitivities)
+df_SVM = data.frame((1-roc_SVM$specificities), roc_SVM$sensitivities)
+df_LDA = data.frame((1-roc_LDA$specificities), roc_LDA$sensitivities)
+```
+
+```{r  message=FALSE, eval = FALSE}
+
+plot(df_RF, col="red", type="l",     
+xlab="False Positive Rate (1-Specificity)",
+ylab="True Positive Rate (Sensitivity)", main="ROC Chart")
+lines(df_SVM, col="blue")             
+lines(df_LDA, col="green") 
+grid(NULL, lwd = 1)
+
+abline(a = 0, b = 1, col = "lightgray")
+
+legend("bottomright",
+c("Random Forest","SVM", "LDA"),
+fill=c("red","blue", "green"))
+```
+
+## AUC Table
+```{r  message=FALSE, eval = FALSE}
+
+auctable=tibble("model"=c("RF", "SVM", "LDA"),"AUC"=c(auc(roc_RF), 
+                                     auc(roc_SVM), auc(roc_LDA)))
+auctable
+```
+
+## Cumulative Gain Charts
+```{r  message=FALSE, eval = FALSE}
+
+GainTable_RF <- cumGainsTable(RF_model_under_prob, test_set$target, resolution = 1/100)
+GainTable_SVM <- cumGainsTable(SVM_prob, test_set_small$target, resolution = 1/100)
+GainTable_LDA <- cumGainsTable(LDA_prob, test_set_small$target, resolution = 1/100)
+```
+
+```{r  message=FALSE, eval = FALSE}
+
+plot(GainTable_RF[,4], col="red", type="l", lwd = 2,   
+xlab="Percentage of test instances", 
+ylab="Percentage of correct predictions", main="Cumulative Gain Chart")
+lines(GainTable_SVM[,4], col="blue", type ="l",lwd = 2)
+lines(GainTable_LDA[,4], col="green", type ="l",lwd = 2)
+grid(NULL, lwd = 1)
+
+legend("bottomright",
+c("Random Forest","SVM", "LDA"),
+fill=c("red","blue","green"))
+
+abline(a = 0, b = 1, col = "lightgray")
+```
+
+## Lift Charts
+```{r  message=FALSE, eval = FALSE}
+
+liftChart(predict_lda , test_set_small$target)
+liftChart(svm_prediction_over_linear_70_pos , test_set_small$target)
+liftChart(prediction_RF_under, test_set$target)
+```
+
+\newpage
+
+#Other model types used in report
+
+## GLM
+
+### Oversampling
+```{r  message=FALSE, eval = FALSE}
+
+data.over <- ovun.sample(target~., data=training_set_small, method="over", seed=10)$data
+```
+
+### GLM Model 1
+```{r  message=FALSE, eval = FALSE}
+
+log_reg <- glm(target ~.,data.over, family = "binomial")
+log_reg_predict <- predict(log_reg, test_set_small, type = "response")
+log_reg_class <- ifelse(log_reg_predict >0.6, "1", "0")
+log_reg_class <- as.factor(log_reg_class)
+cf_glm_over_70 <- confusionMatrix(log_reg_class, test_set_small$target, positive = "1",
+                                                                  mode = "prec_recall")
+```
+
+### Undersampling 
+```{r  message=FALSE, eval = FALSE}
+data.under <- ovun.sample(target~., data=training_set_small, method="under", seed=10)$data
+```
+
+### GLM Model 2
+```{r  message=FALSE, eval = FALSE}
+
+log_reg2U <- glm(target ~.,data.under, family = "binomial")
+log_reg_predict2U <- predict(log_reg2U, test_set_small, type = "response")
+log_reg_class2U <- ifelse(log_reg_predict2U >0.65, "1", "0")
+log_reg_class2U <- as.factor(log_reg_class2U)
+cf_glm_under_70 <- confusionMatrix(log_reg_class2U, test_set_small$target, positive = "1",
+                                                                     mode = "prec_recall")
+```
+
+## Decision trees
+
+### Oversampling
+```{r  message=FALSE, eval = FALSE}
+oversample_data_70 <- ROSE:: ovun.sample(target~. , data = training_set_small,
+                                     method = "over", p = 0.5, seed = 1)$data
+```
+
+### Selecting top 100 attributes based on their Information Gain
+```{r  message=FALSE, eval = FALSE}
+
+attrweights_over_70 <- FSelector:: information.gain(target~., oversample_data_70)
+attrweights_over_70 <- attrweights_over_70 %>% arrange(desc(attr_importance))
+selectedattr_over_70 <- FSelector:: cutoff.k(attrweights_over_70, 100)
+
+
+oversample_70 <- oversample_data_70[selectedattr_over_70]
+oversample_70$target <- oversample_data_70$target
+```
+
+### Tree() Model
+```{r  message=FALSE, eval = FALSE}
+
+regtree_70_over <- tree(target~., data=oversample_70)
+summary(regtree_70_over)
+print(regtree_70_over)
+
+plot(regtree_70_over)
+text(regtree_70_over)
+
+regtree_70_over_pre <- predict(regtree_70_over, test_set_small, type="class")
+correct_regtree_70_over <- which(test_set_small$target == regtree_70_over_pre)
+length(correct_regtree_70_over)
+
+cf_tree_over_70_100IG <- confusionMatrix(regtree_70_over_pre,
+test_set_small$target, positive='1', mode = "prec_recall")
+```
+
+### Ctree() Model
+```{r  message=FALSE, eval = FALSE}
+
+DeTree_70_over <- ctree(target~., data=oversample_70)
+
+DeTree_70_over_pre <- predict(DeTree_70_over, test_set_small)
+correct_DeTree_70_over <- which(test_set_small$target == DeTree_70_over_pre)
+length(correct_DeTree_70_over)
+(accuracy_DeTree_70_over <- length(correct_DeTree_70_over)/nrow(test_set_small)*100)
+
+cf_ctree_70_100IG <- confusionMatrix(DeTree_70_over_pre, 
+test_set_small$target, positive='1', mode = "prec_recall")
+```
+
+## Other SVMs used
+
+### Splitting using 60/40 ratio
+```{r  message=FALSE, eval = FALSE}
+
+split_60 <- caTools:: sample.split(datasmall$target, SplitRatio =0.6)
+
+training_set_60 <- subset(datasmall, split_60 ==TRUE)
+test_set_60 <-subset(datasmall, split_60 ==FALSE)
+```
+
+### Both sampling
+```{r  message=FALSE, eval = FALSE}
+
+set.seed(123)
+
+bothsample_data_60 <- ROSE:: ovun.sample(target~. , data = training_set_60,
+                                   method = "both", p = 0.5, seed = 1)$data
+```
+
+### Selecting all attributes with positive Information Gain
+```{r  message=FALSE, eval = FALSE}
+
+attribute_weights_both_60_pos <- FSelector:: information.gain(target~., bothsample_data_60)
+selected_attribute_both_60_pos <- attribute_weights_both_60_pos %>%
+filter(attr_importance > 0) %>% mutate(indexNames = row.names.data.frame(.)) %>%
+                                                              pull(.,indexNames)
+
+
+bothsample_data_all_60_pos <- bothsample_data_60
+bothsample_data_60_pos <- bothsample_data_all_60_pos[selected_attribute_both_60_pos]
+bothsample_data_60_pos$target <- bothsample_data_all_60_pos$target
+```
+
+### SVM Model 1
+```{r  message=FALSE, eval = FALSE}
+
+svm_model_both_radial_60_pos <- e1071:: svm(target~., data = bothsample_data_60_pos,                     kernel="radial", scale=TRUE, probability = TRUE)
+svm_prediction_both_radial_60_pos <- predict(svm_model_both_radial_60_pos, test_set_60)
+
+(cf_svm_both_radial_60_pos <- caret:: confusionMatrix(svm_prediction_both_radial_60_pos,
+                              test_set_60$target, positive = "1", mode = "prec_recall"))
+```
+
+### Additional SVM Model with tuning 
+```{r  message=FALSE, eval = FALSE}
+svm_for_tuning_no_sampling_60 <-e1071:: svm(target~., data = training_set_60,
+                                                           kernel = "radial")
+
+tune_out_60 = e1071:: tune(method = "svm",  target~. , data = training_set_60,
+             kernel = "radial", tunecontrol = e1071::tune.control(cross = 10))
+
+svm_prediction_tune_60 <- predict(tune_out_60$best.model, test_set_60)
+cf_svm_prediction_tune_60 <- caret:: confusionMatrix(svm_prediction_tune_60,
+                  test_set_60$target, positive = "1", mode = "prec_recall")
+```
+
+
+## Naive Bayes
+
+### Oversampling
+```{r  message=FALSE, eval = FALSE}
+
+oversampledtraining60 <- ROSE::ovun.sample(target~., 
+data = training_set_60, method = "over", p = 0.5, seed = 111)$data
+```
+
+### Tuning
+```{r  message=FALSE, eval = FALSE}
+search_grid <- expand.grid(
+  usekernel = c(TRUE, FALSE),
+  fL = 0:5,
+  adjust = seq(0, 5, by = 1)
+)
+```
+
+### Model
+```{r  message=FALSE, eval = FALSE}
+#install.packages("klaR")
+library(klaR)
+
+features <- setdiff(names(training_set_60), "target")
+x <- training_set_60[, features]
+y <- training_set_60$target
+
+train_control <- trainControl(
+method = "cv", 
+number = 10
+)
+
+nb.m2 <- train(
+  x = x,
+  y = y,
+  method = "nb",
+  trControl = train_control,
+  tuneGrid = search_grid,
+  preProc = c("center", "scale", "pca")
+  )
+
+nb.m2$results %>% 
+  top_n(5, wt = Accuracy) %>%
+  arrange(desc(Accuracy))
+
+
+pred <- predict(nb.m2, newdata = test_set_60)
+(cf_nb_60 <- confusionMatrix(pred, test_set_60$target,
+                  positive='1', mode = "prec_recall"))
+```
+
+## Neural Network
+
+### SMOTE
+```{r  message=FALSE, eval = FALSE}
+#install.packages("DMwR")
+library(DMwR)
+smotedt <- as.data.frame(training_set_small)
+smotedt$target <- as.factor(smotedt$target)
+
+smote_round1 <-
+  DMwR::SMOTE(
+    form = target ~ .,
+    data = smotedt,
+    perc.over = 100,
+    perc.under = 200
+  )
+```
+
+### Model
+```{r  message=FALSE, eval = FALSE}
+#install.packages("neuralnet")
+library(neuralnet)
+nn=neuralnet(target~ ., data=smote_round1, hidden=100,act.fct = "logistic",
+                linear.output = FALSE)
+
+Predict=compute(nn,test_set_small)
+prob <- Predict$net.result
+pred <- ifelse(prob>0.5, "1", "0")
+pred <- as.factor(pred[,2])
+class(pred)
+
+(cf_nn_70 <- confusionMatrix(pred, test_set_small$target, 
+                     positive='1', mode = "prec_recall"))
+```
+
+\newpage
+
+# Plots used in the report
+
+## Exporting the outputs of the confusion matrices
+```{r  message=FALSE, eval = FALSE}
+tocsv <- data.frame()
+
+#Named all variables with "cf_", so that we can easily 
+#find all matrices and export them to csv
+for (file in ls()){
+  print(paste("testing file", file))
+  if (stringr::str_detect(file, "cf_")){
+    cm <- get(file)
+    print(cm)
+    tocsv2 <- data.frame(cbind(file, t(cm$overall),t(cm$byClass)))
+    tocsv <- rbind(tocsv, tocsv2)
+  }}
+
+
+write.csv(tocsv,file="final_models.csv")
+```
+
+## Model comparsion plot
+```{r message=FALSE, eval = FALSE}
+library(ggplot2)
+library(stringr)
+library(gridExtra)
+library(readxl)
+library(tidyverse)
+
+plotting_data <- read_excel("report_plot_models.xlsx")
+plotting_data$Sample <- NULL
+plotting_data$type <- as.factor(plotting_data$type)
+plotting_data$Partition <- as.factor(plotting_data$Partition)
+plotting_data$TP <- NULL
+
+plotting_data_longer <- plotting_data %>% pivot_longer(5:8)
+
+ggplot(plotting_data_longer) + geom_jitter(aes(x= type, y= value, color = Partition),
+width = 0.1) + theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+theme(legend.position = "bottom") + ylim(0, 1) + labs(x = NULL, y="Values") +
+                                                            facet_grid(~name) 
+```
+
+## Expected profit model comparison chart
+```{r message=FALSE, eval = FALSE}
+
+cost_confusion_path <- "Cost Confusion Matrix.xlsx" 
+
+cost_confusion_data <- read_excel(cost_confusion_path,sheet = "Plotting_Data")
+
+cost_confusion_longer <- cost_confusion_data %>% pivot_longer(cols = c(Low_Cost,
+High_Cost), names_to = "Cost_Type") %>% mutate(Cost_Type = factor(Cost_Type),
+`Model_No_[]` = factor(`Model_No_[]`), Model_No = factor(Model_No)) 
+
+levels(cost_confusion_longer$Cost_Type) <- c("High Cost Scenario", "Low Cost Scenario")
+
+ggplot(cost_confusion_longer, aes(x= Model_No,y = value, fill = Cost_Type, 
+color = factor(ifelse(Name=="RF 70% Stratified + Under 100 IG", "Yes", "No")))) + 
+geom_col()+ facet_grid(~Cost_Type) + scale_fill_manual(values = c("#55e6b0", "#5cd5e0")) +
+                            scale_color_manual( values=c("white", "black"), guide=FALSE) +
+labs(y = "Expected Profit in £", fill = "Scenario",
+x = "Model Number (see below for further information)") +
+                      theme(legend.title=element_blank())
+```
+
+## Testing final model for overfitting plot
+```{r message=FALSE, eval = FALSE}
+
+plotting_data_final <- read.csv("final_models.csv")
+
+plotting_data_final <- plotting_data_final %>% mutate(categorie = 
+ifelse(str_detect(file, "train"), "Training", "Test"), type = "RF")
+
+plotting_data_final_longer <- plotting_data_final %>% select("file", 
+"Accuracy", "Precision", "Recall","F1" , "categorie","type") 
+
+plotting_data_final_longer <- plotting_data_final_longer %>% 
+pivot_longer(cols = c("Accuracy", "Precision", "Recall", "F1")) 
+
+ggplot(plotting_data_final_longer) + geom_point(aes(x= name, y= value, 
+color =categorie)) + ylim(0, 1) + 
+labs(y = "Value in %", x = "Measure", col = "Set",
+ title = "Testing final model on overfitting")
+
+```
+
