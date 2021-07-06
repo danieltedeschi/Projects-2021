@@ -1,0 +1,1132 @@
+---
+title: "Individual TA assignment"
+author: "Daniel Tedeschi"
+date: "12/06/2021"
+output:
+  word_document: default
+  html_document: default
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+The following report focuses on analysing the textual information published by 37 companies of the S&P 500 from the year 2010 to 2020. The analysis will focus specifically on the management discussion present in the 10-K filings. 
+The paper is structured in three distinct segments. Firstly, the relevant data will be extracted, cleaned and put into a tidy format. Subsequently, the data, through statistical manipulation will be merged into creating a corpus, needed for the subsequent segments of the analysis. 
+The second part of the analysis consists in analysing the sentiments present in the various reports. Through the use of various sentiment dictionaries, the unstructured and qualitative part of the dataset will be quantified and the impact that of the various sentiments have on the price variation will be assessed. 
+Finally,  the third segment of the analysis will focus on carrying a topic modelling analysis on the reports to assess firstly how many topics are present in the various reports, and secondly,  how many of the topics, if any, are significant in predicting the variation of the stock prices. 
+
+
+
+ The first necessary step consisted in the setting of the environment, containing all of the needed libraries, necessary to complete the code.
+```{r acquiring relevant packages, eval=FALSE}
+# ----- Downloading relevant packages
+library(edgar)
+library(tidyverse)
+library(tidytext)
+library(dplyr)
+library(ggplot2)
+library(MASS)
+library(SentimentAnalysis)
+library(textreadr)
+library(tm)
+library(BatchGetSymbols)
+library(stopwords)
+library(qdap)
+library(stargazer)
+library(stm)
+library(corpus)
+```
+
+Successively, the whole master indexes were downloaded for the timeframe between 2010 and 2020. This step was followed by the formatting of the documents into a data frame, the correct format for further analysis.
+```{r getindex, eval=FALSE}
+#---- Donloading master indexes from edgar within the years 2010 to 2020
+edgar::getMasterIndex(2010:2020)
+```
+
+
+The scope of the code was related to the analysis of the management discussions present in the 10-K filings, therefore, a new table was created containing solely documents whose form type was 10-Ks. 37 companies were chosen at random from the appendix file in the assignment description. The Selected companies dataset was then used to extract only the matching management discussions.
+```{r tidying master index, eval=FALSE}
+# Creating a dataframe with the downloaded master indices 
+master_indexes <- list.files("Master Indexes/", pattern="Rda")
+all_indexes <- data.frame()
+
+for (Master_index in master_indexes) {
+  load(paste0("Master indexes/", Master_index))
+  this_index <- year.master
+  all_indexes <- bind_rows(all_indexes, this_index)
+  print(Master_index)}
+  
+
+```
+Prior the start of the analysis the recently obtained management discussion table had to be cleaned up. Therefore, a loop was created to extract the relevant information from the untidy table and inputted it into the newly created table, named management discussion.
+```{r selecting 37 companies, eval=FALSE}
+#Selecting only those documents that are 10-K
+tenK_indexes <- all_indexes %>% filter(form.type == "10-K")
+
+#Creating a subset with 37 companies from the assignment appendix
+selected_companies <- tenK_indexes%>% filter(cik %in% c("1467373", "796343","2488", "1086222", "1101215","820313","6281", "1013462", "320193", "6951","1596532","769397", "8670", "1730168", "1383312","813672", "858877", "877890", "1058290", "24741", "1688568", "1048695", "1136893", "798354", "1175454", "354908", "1262039", "749251", "1123360", "1645590", "47217", "50863", "51143", "896878", "1141391", "743316", "789019"))
+rm(tenK_indexes)
+
+#conveting the file date to date
+selected_companies$date.filed <- lubridate::ymd(selected_companies$date.filed)
+
+```
+
+
+```{r extracting management discussion, eval=FALSE}
+#extracting the management discussion for the selected companies 
+
+edgar::getMgmtDisc(cik.no = selected_companies$cik,filing.year = 2010:2020)
+
+
+list_of_files <- list.files(path = "./MD&A section text", recursive = TRUE,
+                            pattern = "\\.txt$", 
+                            full.names = TRUE)
+```
+
+```{r tidying management discussion, eval=FALSE}
+# ----- Formatting the management discussion into a clean data frame 
+tenK_length <- length(list_of_files)
+
+management_discussion <- data.frame(CIK=numeric(tenK_length), Company_name = character(tenK_length), Form_type= character(tenK_length), Filing_date= character(tenK_length), Accession_Number = character(tenK_length), Report= character(tenK_length)) 
+
+for (i in 1:tenK_length){
+  
+  reading_documents <- readLines(list_of_files[i])
+  management_discussion$CIK[i] <- as.numeric(gsub("CIK: ", "", reading_documents[1]))
+  management_discussion$Company_name[i] <- as.character(gsub("Company Name: ", "", reading_documents[2]))
+  management_discussion$Form_type[i] <- as.character(gsub("Form Type: ", "", reading_documents[3]))
+  management_discussion$Filing_date[i]<- as.character(gsub("Filing Date: ","", reading_documents[4]))
+  management_discussion$Accession_Number[i] <- as.character(gsub("Accession Number: ","",reading_documents[5]))
+  management_discussion$Report[i] <- as.character(gsub("ITEM 7. MANAGEMENT S DICUSSION AND ANALYISIS OF FINANCIAL CONDITION AND RESULTS OF OPERATIONS","",reading_documents[8]))
+  
+}
+# Creating row number index for future joins
+management_discussion <- management_discussion %>% mutate(row=row_number())
+
+#creating a copy for future reference
+management_discussion_copy <- management_discussion
+```
+
+The first analysis, consisted in plotting the QDAP and LM sentiment across the 37 selected firms. This was a superficial exploratory analysis where only two dictionaries were used, the Loughran-McDonald one, the main reference for financial textual analysis and the QDAP dictionary. In terms of the former, Microsoft is the company with the highest sentiment score while Broadridge financial solutions INC is the company with the lowest score. On the other hand, looking at the QDAP scores, CDW is the company with the highest score while Cadence Design Systems is the one with the lowest. However, prior cleaning of the data these findings can not be considered insightful or relevant, and therefore are just used as an exploratory analysis to get a feeling of the sentiments present in the data.
+
+```{r sentiment exploratory analysis, eval=FALSE}
+# Extracting sentiments from management report
+sentiment_discussion <- analyzeSentiment(management_discussion$Report) %>% mutate(row=row_number())
+#Creating subset containing CIK and company name
+subset_for_sentiment <- management_discussion %>% dplyr::select(Company_name, CIK)%>% mutate(row= row_number())
+#Joining the table 
+sentiment_discussion <- sentiment_discussion %>% left_join(subset_for_sentiment, by="row")
+
+#PLOTTING THE DIFFERENCE BETWEEN QDAP AND LM
+ggplot(sentiment_discussion, aes(x=Company_name, y=SentimentQDAP))+ geom_line(colour="blue") + coord_flip() + labs(title = "QDAP and LM sentiment across the 37 firms", y="Company name", x="QDAP and LM score") + geom_line(aes(y=SentimentLM),colour="red")
+
+rm(sentiment_discussion, subset_for_sentiment)
+```
+Once all of the relevant documents were formatted into a table, the reports were cleaned from punctation, white spaces and number to then be tokenized.
+```{r cleaning management discussion, eval=FALSE}
+#tokenizing and removing stopwords
+management_discussion$Report <- management_discussion$Report%>% stripWhitespace() %>% removePunctuation() %>% removeNumbers() 
+management_discussion <- management_discussion %>% mutate(year= format(Filing_date, format="%Y"))
+management_discussion_tokenized <- management_discussion %>% unnest_tokens(word, Report)%>% count(row, word, sort=T) 
+```
+
+Following the tokenization of the reports and the antijoin with the stop words library, a TF-IDF analysis was carried. Following the plotting of the TF-IDF value, we were able to assess how the values follow a ZIPF’s law distribution. Through the use of box-plots outliers were detected. Therefore, to clean the data from outliers, a cut-off value of 0.02 has been implemented. Furthermore, to clean the data from extremely recurrent words, the bottom 5% of the distribution has been considered as custom stop words, resulting in the removal of 10215 tokens.
+```{r TF-IDF, eval=FALSE}
+# ---- Doing TF-IDF on the tokenized words
+management_tf_idf <- management_discussion_tokenized %>% anti_join(stop_words)%>% ungroup()%>% bind_tf_idf(word,row,n) %>% group_by(word) %>% mutate(avg_tf_idf= mean(tf_idf))%>% arrange(desc(avg_tf_idf))
+management_tf_idf <- management_tf_idf%>% left_join(management_discussion, by="row")%>%  dplyr::select(CIK, Company_name,word,n, tf_idf, avg_tf_idf, Filing_date,row)
+```
+
+
+```{r TF-IDF plots, eval=FALSE}
+# ------- Plotting the distribution of TF-IDF values
+management_tf_idf %>% ggplot(.,aes(x=avg_tf_idf))+ geom_histogram(colour="blue", fill="blue", bins=700)+ scale_y_log10()+ labs(title = "TF-IDF on log scale", x="Words", y="Average TF-IDF")
+
+management_tf_idf %>% ggplot(.,aes(x=avg_tf_idf))+ geom_boxplot()+ coord_flip() + labs(title="Box plots of TF-IDF values", x=" TF IDF")
+```
+
+
+```{r custom stop-words, eval=FALSE}
+# ---- Removing outliers and creating custom stop words based on the frequency 
+
+management_tf_idf_filtered <- management_tf_idf %>% filter(avg_tf_idf <0.02) %>% arrange(desc(avg_tf_idf))%>% top_frac(0.95)
+
+#---- creating custom stop-words
+management_tf_idf_stopwords <- management_tf_idf %>% anti_join(management_tf_idf_filtered, by="word") %>% arrange(desc(avg_tf_idf))
+
+#---- removing company names from management discussion 
+company_names <- selected_companies %>% dplyr::select(company.name)%>% rename(word=company.name) 
+
+#---- plotting log distribution of average TF_IDF
+management_tf_idf_filtered %>% ggplot(.,aes(x=avg_tf_idf))+ geom_histogram(colour="blue", fill="blue", bins=700)+ scale_y_log10()+ labs(title = "TF-IDF on log scale filtered", x="Words", y="Average TF-IDF")
+
+custom_stop_words <- management_tf_idf_stopwords$word %>% as.data.frame()
+
+# VIsualising most frequent words according for stopwords and filtered tables 
+management_tf_idf_stopwords %>% head(50)%>% ggplot(.,aes(x=avg_tf_idf, y=word))+ geom_col(colour="blue") + labs(title="most frequent stop-words", x="TF-IDF", y="Term")
+management_tf_idf_filtered %>% head(80) %>% ggplot(.,aes(x=avg_tf_idf, y=word))+ geom_col(colour="red")+ labs(title="Most frequent filtered words", x="TF-IDF", y="Term")
+```
+The tokenization process is not always impeccable, therefore, as a way to counter the potential insertion of wrongly-tokenized words the length of words have been analysed. Therefore, a new column depicting the length of the words has been created and plotted (figure 5). Also by using the quantile function the top 5% of observations with the greatest length has been identified, leading to the filtering of words with less than 13 characters.
+```{r filtering length of words, eval=FALSE}
+management_tf_idf_filtered$size <- nchar(management_tf_idf_filtered$word)
+management_tf_idf_filtered%>% ggplot(aes(x=size))+ geom_histogram(bins = 200, colour="blue") + labs(title="Distribution of words' length", x="Lenght", y="Frequency")
+quantile(management_tf_idf_filtered$size,c( 0.05, 0.95))
+
+management_tf_idf_filtered <- management_tf_idf_filtered %>% filter(size < 13)
+```
+Once the data was cleaned, an exploratory analysis was carried to determine the difference from unfiltered and filtered data. Therefore, plots were created representing the most recurrent terms aggregated first by year and successively by sub-industry.
+```{r yearly most frequent words, eval=FALSE}
+# ---- Plotting the most frequent words per year on filtered data 
+management_tf_idf_filtered$Filing_date<- lubridate::ymd(management_tf_idf_filtered$Filing_date)
+
+management_tf_idf_filtered <- management_tf_idf_filtered %>% mutate(year= format(Filing_date, format="%Y"))
+
+management_tf_idf_filtered <- management_tf_idf_filtered %>%  anti_join(custom_stop_words, by=c("word"=".")) %>% anti_join(stop_words) 
+year_table_plot <- management_tf_idf_filtered %>%mutate(year= format(Filing_date, format="%Y"))
+
+year_table_plot %>%  arrange(desc(tf_idf)) %>% mutate(word= factor(word, levels=rev(unique(word))))%>% group_by(year) %>% slice(1:10) %>% ungroup()%>% ggplot(aes(word,tf_idf, fill=year))+ geom_col(show.legend = F)+ facet_wrap(~year, scales="free")+ coord_flip()+ labs(x=" Recurrent terms", y="TF-IDF value", title="Most recurrent filtered word per year")
+rm(year_table_plot)
+```
+
+
+```{r unfiltered yearly most frequent words, eval=FALSE }
+# ---- Plotting the most frequent words per year on unfiltered data 
+management_tf_idf_filtered$Filing_date<- lubridate::ymd(management_tf_idf_filtered$Filing_date)
+
+management_tf_idf_filtered <- management_tf_idf_filtered %>% mutate(year= format(Filing_date, format="%Y"))
+
+
+year_table_plot <- management_discussion %>%mutate(year= format(Filing_date, format="%Y"))%>% unnest_tokens(word, Report) %>% anti_join(stop_words) %>%  count(word, year, sort=T) %>% ungroup()%>% bind_tf_idf(word, year, n) 
+
+year_table_plot$year <- year_table_plot$year %>% lubridate::ymd(.) %>% substring(., 1,4)
+
+year_table_plot %>% arrange(desc(tf_idf)) %>% mutate(word= factor(word, levels=rev(unique(word))))%>% group_by(year) %>% top_n(10) %>% ungroup()%>% ggplot(aes(word,tf_idf, fill=year))+ geom_col(show.legend = F)+ facet_wrap(~year, scales="free")+ coord_flip()+ labs(x=" Recurrent terms", y="TF-IDF value", title="Most recurrent unfiltered word per year")
+rm(year_table_plot)
+```
+
+
+```{r yearly filtered most frequent words, eval=FALSE}
+#----- Plotting most frequent words per year on filtered reports
+year_table_plot_2 <- management_discussion %>%mutate(year= format(Filing_date, format="%Y"))%>% unnest_tokens(word, Report)%>% anti_join(stop_words) %>% anti_join(management_tf_idf_stopwords, by="word") %>% anti_join(company_names) %>%  count(word, year, sort=T) %>% ungroup()%>% bind_tf_idf(word, year, n) 
+
+year_table_plot_2$year <- year_table_plot_2$year %>% lubridate::ymd(.) %>% substring(., 1,4)
+
+year_table_plot_2 %>% arrange(desc(tf_idf)) %>% mutate(word= factor(word, levels=rev(unique(word))))%>% group_by(year) %>% top_n(10) %>% ungroup()%>% ggplot(aes(word,tf_idf, fill=year))+ geom_col(show.legend = F)+ facet_wrap(~year, scales="free")+ coord_flip()+ labs(x=" Recurrent terms", y="TF-IDF value", title="Most recurrent filtered word per year")
+rm(year_table_plot_2)
+```
+
+```{r extracting sub-industries, eval=FALSE}
+#------ Reading initial appendix table with subsectors of companied
+library(readxl)
+list_of_companies_complete<- read_excel("~/Downloads/list of companies.xlsx")
+
+list_of_companies <- list_of_companies_complete%>% dplyr::select(CIK, GICS_Sub_Industry)
+
+#----- Joining sub sector to existing tables
+list_of_companies$CIK<- list_of_companies$CIK%>% as.numeric()
+
+management_tf_idf_filtered <- management_tf_idf_filtered %>% left_join(list_of_companies)
+
+GICS_table <- management_discussion %>% left_join(list_of_companies)
+
+```
+
+
+```{r sub-industry most frequent word, eval=FALSE}
+##---- Plotting most frequent words per sub-sector on filtered reports
+Industry_plot_stopwords <- GICS_table %>% unnest_tokens(word, Report)%>% anti_join(management_tf_idf_stopwords, by="word")%>% anti_join(stop_words) %>% anti_join(company_names)%>%count(word, GICS_Sub_Industry, sort=T) %>% ungroup()%>% bind_tf_idf(word, GICS_Sub_Industry, n)
+
+
+Industry_plot_stopwords %>% arrange(desc(tf_idf)) %>% mutate(word= factor(word, levels=rev(unique(word))))%>% group_by(GICS_Sub_Industry) %>% top_n(10) %>% ungroup()%>% ggplot(aes(word,tf_idf, fill=GICS_Sub_Industry))+ geom_col(show.legend = F)+ facet_wrap(~GICS_Sub_Industry, scales="free")+ coord_flip() + labs(x=" Recurrent terms", y="TF-IDF value", title="Most recurrent filtered word per Sub_Industry")
+rm(Industry_plot_stopwords)
+```
+Following the creation of the corpus, the second segment of the code focuses on quantifying the textual features of the reports. Through the use of sentiment analysis, using a number of different dictionaries, the more subtle textual feature can be extracted, leading to insights and more importantly allowing the quantification of text.
+The desired outcome of sentiment analysis on the 10-Ks management discussion, is to identify features on how the reports are written and find a correlation with the variation in stock prices. The latter point has been extensively researched, leading to the conclusion that financial investor, prior making decisions on their assets, rely not only on quantitative features but as well on qualitative aspects such as the tone and sentiments in the textual information regarding their assets (Henry 2008; Loughran and McDonald 2011; Tetlock 2007).
+The analysis will be carried using the Loughran-McDonald, Bing-Liu, NRC, Afinn, QDAP, HE and GI dictionaries.
+
+
+The first step consisted in extracting the company symbol and joining it to the table containing the management discussion.
+
+```{r clening table to extract stock price, eval=FALSE}
+#joining stock symbols with management discussion 
+
+symbol_table <- list_of_companies_complete %>% dplyr::select(CIK, Symbol)
+symbol_table$CIK <-symbol_table$CIK %>% as.numeric()
+
+#----- creating table to extract stock prices
+management_discussion <- management_discussion %>% left_join(symbol_table, by="CIK")
+
+management_discussion$year <- management_discussion$year %>% lubridate::ymd(.) %>% substring(., 1,4)
+```
+
+The step was needed in order to put in a tabular format the parameters for the stock prices to be extracted. The latter, was achieved through the use of the BatchGetSymbol function. Successively, a new table was created for further analysis, containing rather than the price before and after the release of the management discussion, the difference of it as well as variation in volume and percentage difference obtained for the adjusted log return of the stock prices. To achieve such a dataset, the parameters inserted in the GetBatchSymbol function were seven days before and three days after the release of the report. These parameter were picked as the anticipation prior the release might impact the price, therefore by setting the first date as seven days before the risk should be mitigated. On the other hand, selecting the price three days after the release of the report might give a realistic representation of the variation without the fluctuations that may be present one or two days after the release.
+```{r GetBatchSymbol, eval=FALSE}
+#extracting the stock prices for the company whose management report was extracted. Also creating a table with the difference in stock prices, in volume and percentage difference.
+
+management_discussion$Filing_date <- lubridate::ymd(management_discussion$Filing_date)
+management_discussion<- management_discussion %>% filter(Symbol != "CDW") #-- Had to be removed as the function was not able to extract its stock prices
+
+stock_table <- data.frame(diff_in_price_close = numeric(), percentage_difference= as.numeric(), diff_in_volume = numeric(),ticker = character(), year = numeric())
+
+for (i in 1:nrow(management_discussion)) {
+  week_prices <- BatchGetSymbols::BatchGetSymbols(management_discussion[i,]$Symbol,
+                                  freq.data = "weekly",              
+                                 first.date = management_discussion$Filing_date[i] - 7,
+                                 last.date = management_discussion$Filing_date[i] +3, 
+                                 type.return = "log")
+ 
+    stock_table[i,]$ticker <- week_prices$df.tickers$ticker[1]
+  stock_table[i,]$year <- lubridate::year(week_prices$df.tickers$ref.date[1])
+  stock_table[i,]$diff_in_price_close <- week_prices$df.tickers$price.close[nrow(week_prices$df.tickers)]-week_prices$df.tickers$price.close[1]
+  stock_table[i,]$diff_in_volume <- week_prices$df.tickers$volume[nrow(week_prices$df.tickers)]-week_prices$df.tickers$volume[1]
+  stock_table[i,]$percentage_difference <- ((week_prices$df.tickers$price.close[nrow(week_prices$df.tickers)]-week_prices$df.tickers$price.close[1]) / week_prices$df.tickers$price.close[1])*100
+}
+
+saveRDS(stock_table, "stock_table.rds")
+```
+
+
+```{r joining stock prices with management discussion, eval=FALSE}
+# Creating a primary key using year and symbol. THis will be needed to join it with management discussion
+stock_table$PK <- paste(stock_table$year," ", stock_table$ticker)
+management_discussion$PK <- paste(management_discussion$year," ", management_discussion$Symbol)
+
+table_part_b <- stock_table %>% inner_join(management_discussion, by="PK") 
+
+#plotting the distribution of the stock price variation
+table_part_b %>% ggplot(.,aes(x=diff_in_price_close))+ geom_histogram() + labs(title="distribution of stock price difference", x="difference in stock prices", y="count")
+```
+Finally, possessing all relevant information, the management reports were tokenized, stemmed and lemmatized through the use of the UD Pipe function. Successively, from the list of tokens, only verbs noun and adjective were filtered, following the assumption that they hold the most contextual value.
+
+```{r UDPIPE, eval=FALSE}
+# Cleaing the textual information by remving stopwords and other irrelevant textual features
+customstopwords <- c("fiscal", "tax", "financial", "increase", "revenue", "income", "market", "operations", "service", "expense") %>% as.data.frame()
+
+postagged_table_B <- udpipe:: udpipe(object = langmodel, x = table_part_b$Report, parallel.cores = no_cores,
+                   # parallel.chunks = 100,
+                   # trace = T)
+
+postagged_table_B <- postagged_table_B %>% filter(upos %in% c("VERB", "NOUN", "ADJ")) %>% dplyr::select(lemma, doc_id)
+saveRDS(postagged_table_B, "postagged_table_B.rds")
+
+postagged_table_B_filtered <- postagged_table_B %>% anti_join(management_tf_idf_stopwords, by=c("lemma"="word")) %>% anti_join(stop_words, by=c("lemma"="word")) %>% anti_join(customstopwords, by=c("lemma"="."))
+
+postagged_table_B_filtered <- postagged_table_B_filtered %>% left_join(table_part_b, by=c("doc_id"="row"))
+subset_sub_industry <- GICS_table %>% dplyr::select(GICS_Sub_Industry, Accession_Number)
+postagged_b_complete <- postagged_table_B_filtered  %>% left_join(subset_sub_industry, by="Accession_Number")%>% dplyr::select(doc_id, lemma, Accession_Number, diff_in_volume, percentage_difference, diff_in_price_close, year.x, GICS_Sub_Industry) %>% mutate(word=lemma)
+
+
+```
+
+Subsequently, the first exploratory analysis undertook consisted in observing the polarity present in the report. This was done using three different aggregation categories. Firstly, the reports as a whole have been used (figure 9). Subsequently, polarity has been carried on a sub-industry and yearly level. The results indicate how companies may try to transfer positiveness in their reports, understandable since it is a pivotal piece of information used by investors in deciding whether to withdraw or invest capitals into the companies. 
+Analysing the sub-industry polarity output (figure 10), once again it is evident how companies try to express positive sentiments in their management discussions. Within the list of industries, the application software appears to be the sub-industry with the highest polarity while the Electronic components & instruments the one with the lowest.
+Lastly, looking at the yearly polarity analysis (figure 11), the most evident aspect is the extremely high variability present in the reports filed in 2020, as well the year with the lowest polarity, on the other hand, the previous year, 2019, was the year with the highest polarity.
+
+
+```{r Polarity table, eval=FALSE}
+# --- Creating table to do polarity 
+industry_subset <- GICS_table %>% dplyr::select(GICS_Sub_Industry, Accession_Number)
+subset_polarity <- table_part_b %>% dplyr::select(Accession_Number,diff_in_price_close, percentage_difference, diff_in_volume, Symbol, Company_name,year.x) %>% left_join(industry_subset)
+
+table_for_polarity <- postagged_b_complete %>% group_by(Accession_Number) %>% summarise(report= paste(word, collapse = " ")) %>% left_join(subset_polarity)
+
+```
+
+```{r polarity, eval=FALSE}
+#---- polarity on the reports 
+report_polarity <- qdap::polarity(table_for_polarity$report)
+
+
+#---- Polarity on sub-industry 
+industry_polarity <- qdap::polarity(table_for_polarity$report, table_for_polarity$GICS_Sub_Industry)
+
+#polarity on years 
+
+year_polarity <- qdap::polarity(table_for_polarity$report, table_for_polarity$year.x)
+
+```
+
+```{r saving polarity, eval=FALSE}
+saveRDS(report_polarity, "report_polarity.rds")
+saveRDS(industry_polarity, "industry_polarity.rds")
+saveRDS(year_polarity, "year_polarity.rds")
+```
+
+```{r plotting polarity, eval=FALSE}
+plot(report_polarity)
+
+plot(industry_polarity)
+
+plot(year_polarity)
+
+```
+
+Following the first exploratory analysis, to better understand the sentiment present in the reports and to identify how they potentially influence the stock prices different sentiment dictionaries have been extracted. The main financial dictionary is the Loughran McDonald one. However, multiple dictionaried have been used to get a better understanding of the different sentimental facets present in the text. For example, by using the NRC dictionary, sentiments such as trust and anticipation can be extracted, sentiments that may have an impact on investors. Subsequently, all of the extracted dictionaries have been merged into one table.
+
+```{r extracting sentiment dictionaries, eval=FALSE}
+# ------- Sentiment Loughran McDonald 
+LM_tokenized <- postagged_b_complete %>% inner_join(get_sentiments("loughran"))
+word_count_LM <- LM_tokenized %>% group_by(Accession_Number) %>% summarise(LM_total=n())
+
+LM_sentiment <- LM_tokenized %>% group_by(Accession_Number, sentiment) %>% summarise(total_sentiment=n()) %>% spread(sentiment, total_sentiment, fill=0) %>% left_join(word_count_LM) %>% mutate(LM_sent= positive-negative, LM_positive= positive/LM_total, LM_negative= negative/LM_total, LM_uncertainty= uncertainty/LM_total, LM_litigious= litigious/LM_total, LM_constraint= constraining/LM_total) %>% dplyr::select(-c(positive, negative, litigious, uncertainty, constraining))
+
+rm(word_count_LM, LM_tokenized)
+
+# ------- Sentiment Afinn 
+Afinn_sentiment <- postagged_b_complete %>% inner_join(get_sentiments("afinn")) %>% group_by(Accession_Number) %>% summarise(afinn_sent= sum(value))
+
+# ----- sentiment Bing 
+
+bing_tokenised <- postagged_b_complete %>% inner_join(get_sentiments("bing"))
+Word_count_bing <- bing_tokenised %>% group_by(Accession_Number) %>% summarise(bing_total = n())
+
+Bing_sentiment <- bing_tokenised %>% group_by(Accession_Number, sentiment) %>% summarise(total_sentiment=n()) %>% spread(sentiment, total_sentiment, fill=0)  %>% left_join(Word_count_bing) %>% mutate(bing_sent= positive -negative, bing_positive= positive/bing_total, bing_negative= negative/bing_total) %>% dplyr::select(-c(positive, negative)) 
+rm(bing_tokenised, Word_count_bing)
+
+#-------- Sentiment NRC
+
+nrc_tokenised<- postagged_b_complete %>% inner_join(get_sentiments("nrc"))
+
+word_count_nrc <- nrc_tokenised %>% group_by(Accession_Number) %>% summarise(nrc_total=n())
+
+sentiment_nrc <- nrc_tokenised %>% group_by(Accession_Number, sentiment) %>% summarise(total_sentiment=n()) %>% spread(sentiment, total_sentiment, fill=0) %>% left_join(word_count_nrc) %>% mutate(nrc_sentiment= positive-negative, 
+                                                                                                                                                                                       nrc_positive= positive/nrc_total, nrc_negative= negative/nrc_total, nrc_anger= anger/nrc_total, nrc_fear= fear/nrc_total, nrc_trust= trust/nrc_total, nrc_sadness= sadness/nrc_total, nrc_surprise= surprise/nrc_total, nrc_disgust= disgust/nrc_total, nrc_joy= joy/nrc_total, nrc_anticipation= anticipation/nrc_total) %>% dplyr::select(-c(positive, negative, anger, fear,trust, sadness, anticipation, disgust))
+                                                                
+rm(nrc_tokenised, word_count_nrc)
+
+                                                                
+# ---- Creating a table containing all of the previously extracted sentiments
+total_sentiments <- LM_sentiment %>% left_join(Bing_sentiment) %>% left_join(sentiment_nrc) %>% left_join(Afinn_sentiment)
+
+rm( Bing_sentiment, sentiment_nrc,Afinn_sentiment)
+
+# ---- Joining everything into one table 
+subset_for_sentiment <- postagged_b_complete %>% dplyr::select(Accession_Number, diff_in_volume, diff_in_price_close, diff_in_volume, year.x, GICS_Sub_Industry, percentage_difference) 
+total_sentiments <- total_sentiments %>% left_join(subset_for_sentiment, by="Accession_Number")
+
+rm(subset_for_sentiment)
+```
+
+```{r plotting average returns, eval=FALSE}
+# ---- Plotting the average stock difference per sub industry
+
+average_difference <- total_sentiments %>% group_by(GICS_Sub_Industry, year.x) %>% summarise(average_difference=mean(diff_in_price_close))
+
+average_difference %>% ggplot(aes(x=year.x,y=average_difference, color=GICS_Sub_Industry))+geom_line(aes(group=GICS_Sub_Industry)) + labs(x="year", y="average difference", title="Average stock prices differences per industry")
+```
+, by analysing the NRC sentiments present in the text more insightful information can be extracted. Figure 13 clearly outlines how, companies, when writing the management reports,  with the aim of positively influencing investors, prevalently use terms that can be associated with sentiments of trust and anticipation.
+```{r plotting NRC sentiment, eval=FALSE}
+# ---- Plotting NRC sentiments
+postagged_b_complete %>% inner_join(get_sentiments("nrc"),by ="word") %>%
+  count(sentiment,Accession_Number) %>% mutate(index = row_number()) %>% filter(!sentiment %in%c("positive", "negative")) %>%
+  ggplot(aes(x=reorder(sentiment,n), y=n, color=sentiment)) %>%
+  + geom_col() + labs(title="NRC sentiment across the reports\n(classification by emotion)",x="Sentiments",y="Frequency in the reports")
+```
+Successively, to dive deeper in the textual featured of the reports and how they relate with sentiments the Bing-Liu dictionary has been used. With the latter, the most frequent positive and negative words have been extracted.  As outlined by figure 14, companies using words such as fair, benefit and significant, try to confer a perception of not only stability but most importantly fairness. On the other hand, the negative words, refer mostly to financial aspects such as losses, debt and liabilities. 
+```{r plotting Bing sentiment, eval=FALSE}
+# Plotting Bing sentiments
+bing_word_counts <-  postagged_b_complete %>%
+  inner_join(get_sentiments("bing")) %>% ungroup()  %>% count(word, sentiment, sort = TRUE)
+
+
+bing_word_counts %>%
+  mutate(word = reorder(word, n)) %>% group_by(sentiment) %>% top_n(20) %>%
+  ggplot(aes(word, n, fill = sentiment)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~sentiment, scales = "free") +
+  labs(y = "Frequency", x = "words") +
+  coord_flip() +
+  ggtitle('most frequent words contributing to positive and negative sentiments')
+```
+The same analysis has then been carried using the Afinn dictionary.  As outlined by Figure 15, the results are very similar to those obtained looking at Bing’ dictionary. However, looking at the positive terms used, there is greater focus on the financial aspects using words such as asset and share
+```{r plotting Afinn sentiment, eval=FALSE}
+
+#---- Plotting Afinn sentiment
+afinn_word_counts <-  postagged_b_complete %>%
+  inner_join(get_sentiments("afinn")) %>% ungroup()  %>% mutate(sentiment = ifelse(value>0,"positive","negative")) %>% count(word, sentiment, sort = TRUE)
+
+afinn_word_counts %>%
+  mutate(word = reorder(word, n)) %>% group_by(sentiment) %>% top_n(20) %>%
+  ggplot(aes(word, n, fill = sentiment)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~sentiment, scales = "free") +
+  labs(y = "Contribution to sentiment", x = NULL) +
+  coord_flip() +
+  ggtitle('Most influent positive and negative words in the reports- Afinn')
+rm(afinn_word_counts)
+```
+
+To further analyse the most relevant words affecting positive and negative sentiments, the analysis continued, once again using the Afinn dictionary. However, now the analysis has been carried on a sub-industry level. The result outline how, using the Afinn dictionary across industries, the result do not vary too much. In fact, as per figure 16, it is visible how every industry has the words fair and asset as the terms that influence the most the positive sentiments present in the reports. On the other hand, loss, is the word that affects the most the negative sentiments present in the reports. This make sense as it is a financial reports and all of the selected companies are in the same main industry.
+```{r plotting Afinn sentiment on sub-industry, eval=FALSE}
+# ---- Plotting afinn sentiment on sub-industries
+afinn_word_counts2 <- postagged_b_complete %>%
+  inner_join(get_sentiments("afinn"))  %>%  ungroup()  %>% mutate(sentiment = ifelse(value>0,"positive","negative")) %>% count(word, sentiment, GICS_Sub_Industry,sort = TRUE) %>% na.omit()
+
+afinn_word_counts2 %>%
+  mutate(word = reorder(word, n)) %>% group_by(sentiment,GICS_Sub_Industry) %>% top_n(10) %>% ungroup()%>%
+  ggplot(aes(word, n, fill = sentiment)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~sentiment, scales = "free") +
+  labs(y = "Contribution to sentiment", x = NULL) +
+  coord_flip() +facet_wrap(~GICS_Sub_Industry,scales="free")+
+  labs(title='Words that contribute to positive and negative sentiment in the report per sub-industry', x="words", y="contribution")
+  rm(afinn_word_counts2)
+```
+To further investigate the findings, the same analysis has been conducted using years as an aggregation category. The latter, as per figure 17, confirms the previous findings, having asset and fair topping the most prevalent positive words per year and loss the negative. 
+```{r plotting Afinn sentiment on year, eval=FALSE}
+# ---- Plotting afinn sentiment on year
+afinn_word_counts_year <- postagged_b_complete %>%
+  inner_join(get_sentiments("afinn"))  %>%  ungroup()  %>% mutate(sentiment = ifelse(value>0,"positive","negative")) %>% count(word, sentiment, year.x,sort = TRUE) %>% na.omit()
+
+afinn_word_counts_year %>%
+  mutate(word = reorder(word, n)) %>% group_by(sentiment,year.x) %>% top_n(10) %>%
+  ggplot(aes(word, n, fill = sentiment)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~sentiment, scales = "free") +
+  labs(y = "Contribution to sentiment", x = NULL) +
+  coord_flip() +facet_wrap(~year.x,scales="free")+
+  labs(title='Words that contribute to positive and negative sentiment in the report from 2010 to 2020', x="words", y="contribution")
+  
+  rm(afinn_word_counts_year)
+```
+Following the sentiment exploratory analysis, a final table, suitable for regression, was created. All non-explanatory or non-relevant variables were excluded. Successively, regression analyses have been carried individually for every sentiment dictionary having the differences in stock prices per management discussion as target variable.
+```{r creating table for regression, eval=FALSE}
+# ---- Removing useless variables for regression table 
+table_for_regression <- total_sentiments %>% rename(year=year.x) %>%  dplyr::select(-c(year, Accession_Number, GICS_Sub_Industry))
+
+table_for_regression_2 <- total_sentiments %>% dplyr::select(Accession_Number, diff_in_price_close, diff_in_volume, percentage_difference) %>% mutate(row=row_number())
+
+sentiment_2 <- analyzeSentiment(table_part_b$Report) %>% mutate(row=row_number()) %>% left_join(table_for_regression_2)
+```
+
+
+```{r doing regression on price difference, eval=FALSE}
+#------- Calculating regression for the different dictionaries
+# --- Loughran-Mcdonald 
+
+regression_LM <- lm(diff_in_price_close~LM_sent+LM_positive+LM_negative+LM_total+LM_uncertainty+LM_litigious+LM_constraint, data=table_for_regression)
+
+#---- Bing LIu 
+regression_bing<- lm(diff_in_price_close~bing_total+bing_sent+bing_positive+bing_negative, data=table_for_regression)
+
+#---- Afinn
+regression_afinn <- lm(diff_in_price_close~afinn_sent, data=table_for_regression)
+
+#----- NRC
+regression_nrc <- lm(diff_in_price_close~nrc_sentiment+nrc_total+ nrc_positive+nrc_negative+nrc_anger+nrc_fear+nrc_trust+nrc_sadness+nrc_surprise+nrc_joy+nrc_disgust+nrc_anticipation, data=table_for_regression)
+
+
+# ---- QDAP 
+regression_QDAP <- lm(diff_in_price_close~SentimentQDAP+NegativityQDAP+PositivityQDAP, data=sentiment_2)
+
+# ------ HE 
+regression_HE <- lm(diff_in_price_close~PositivityHE+NegativityHE+SentimentHE, data=sentiment_2)
+
+#------ GI
+regression_GI<- lm(diff_in_price_close~SentimentGI+PositivityGI+NegativityGI, data=sentiment_2)
+
+# ----- LM using analyzesentiment function
+regression_LM2 <- lm(diff_in_price_close~SentimentLM+NegativityLM+PositivityLM+RatioUncertaintyLM, data=sentiment_2)
+
+
+library(stargazer)
+stargazer::stargazer(regression_LM, regression_bing, regression_afinn, regression_nrc, regression_QDAP, regression_HE, regression_GI,regression_LM2, type = "text")
+rm(regression_LM, regression_afinn,regression_bing,regression_nrc)
+rm(regression_QDAP, regression_HE, regression_GI, regression_LM2)
+```
+
+As per figure 18,  the final regression model, achieved using a backward selection method used a combination of different dictionary. The model achieved an adjusted R-square of 11%, indicating the ability of the model in partially explaining the variation in stock price. Altogether, the result is satisfying, considering the complexity related to the stock prices of companies and the multiple aspect influencing its variation.
+```{r final regression on price difference, eval=FALSE}
+table_price_diff_regression <- table_for_regression %>% dplyr::select(-c(Accession_Number,superfluous,  diff_in_volume, percentage_difference))
+
+table_price_diff_regression_1<-table_price_diff_regression[,-1]
+
+regression_final_diff_price <- lm(formula = diff_in_price_close ~., data = na.omit(table_price_diff_regression_1))
+
+MASS::stepAIC(regression_final_diff_price)
+
+regression_final_diff_price_1 <- lm(diff_in_price_close ~ LM_total + LM_sent + LM_positive + LM_negative + 
+    LM_uncertainty + LM_litigious + LM_constraint + bing_total + 
+    bing_sent + bing_positive + joy + surprise + nrc_total + 
+    nrc_sentiment + nrc_positive + nrc_negative + nrc_anger + 
+    nrc_fear + nrc_trust + nrc_surprise + nrc_disgust + 
+    nrc_joy + afinn_sent, data= na.omit(table_price_diff_regression_1))
+
+summary(regression_final_diff_price_1)
+
+rm(table_price_diff_regression, table_price_diff_regression_1)
+```
+
+```{r doing regression on volume difference, eval=FALSE}
+#------- Changing target variable from stock price difference to volume difference
+
+# --- LM
+regression_LM_volume <- lm(diff_in_volume~LM_sent+LM_positive+LM_negative+LM_total+LM_uncertainty+LM_litigious+LM_constraint, data=table_for_regression)
+
+# ----- Bing
+regression_bing_volume<- lm(diff_in_volume~bing_total+bing_sent+bing_positive+bing_negative, data=table_for_regression)
+
+#---- Afinn
+regression_afinn_volume <- lm(diff_in_volume~afinn_sent, data=table_for_regression)
+
+#----- Afinn
+regression_nrc_volume <- lm(diff_in_volume~nrc_sentiment+nrc_total+ nrc_positive+nrc_negative+nrc_anger+nrc_fear+nrc_trust+nrc_sadness+nrc_surprise+nrc_joy+nrc_disgust+nrc_anticipation, data=table_for_regression)
+
+
+# ---- QDAP 
+regression_QDAP_volume <- lm(diff_in_volume~SentimentQDAP+NegativityQDAP+PositivityQDAP, data=sentiment_2)
+
+#----- HE
+regression_HE_volume <- lm(diff_in_volume~PositivityHE+NegativityHE+SentimentHE, data=sentiment_2)
+
+#----- GI
+regression_GI_volume<- lm(diff_in_volume~SentimentGI+PositivityGI+NegativityGI, data=sentiment_2)
+
+#----- LM from analysesentiment function
+regression_LM2_volume <- lm(diff_in_volume~SentimentLM+NegativityLM+PositivityLM+RatioUncertaintyLM, data=sentiment_2)
+
+
+stargazer::stargazer(regression_LM_volume, regression_bing_volume, regression_afinn_volume, regression_nrc_volume,regression_QDAP_volume, regression_HE_volume, regression_GI_volume, regression_LM2_volume, type = "text")
+rm(regression_LM_volume, regression_afinn_volume,regression_bing_volume,regression_nrc_volume,regression_QDAP_volume, regression_HE_volume, regression_GI_volume, regression_LM2_volume)
+```
+
+```{r final regression on volume difference, eval=FALSE}
+table_volume_diff_regression <- table_for_regression %>% dplyr::select(-c(Accession_Number,superfluous,  diff_in_price_close, percentage_difference))
+
+table_volume_diff_regression_1<-table_volume_diff_regression[,-1]
+
+regression_final_volume_diff <- lm(formula = diff_in_volume ~., data = na.omit(table_volume_diff_regression_1))
+
+MASS::stepAIC(regression_final_volume_diff)
+
+regression_final_volume_diff_1 <- lm(formula = diff_in_volume ~ LM_total + LM_sent + LM_positive + 
+    LM_negative + LM_uncertainty + LM_litigious + LM_constraint + 
+    bing_total + bing_sent + bing_positive + joy + surprise + 
+    nrc_total + nrc_sentiment + nrc_positive + nrc_negative + 
+    nrc_anger + nrc_fear + nrc_trust + nrc_sadness + nrc_surprise + 
+    nrc_disgust + nrc_joy + afinn_sent, data = na.omit(table_volume_diff_regression_1))
+
+summary(regression_final_diff_price_1)
+```
+
+Lastly, another regression was executed, once again, individual regression have been carried for each singular sentiment dictionary to then develop a final model. However, for this model, rather than the stock price difference, the percentage difference has been used as the target variable. Compared to the difference in stock price, the percentage difference has less of its variability explained by the model, having an adjusted R-squared of 8.6%.
+```{r regression on percentage difference, eval=FALSE}
+#----- regression using percentage difference as target variable
+
+
+regression_LM_percentage <- lm(percentage_difference~LM_sent+LM_positive+LM_negative+LM_total+LM_uncertainty+LM_litigious+LM_constraint, data=table_for_regression)
+
+regression_bing_percentage<- lm(percentage_difference~bing_total+bing_sent+bing_positive+bing_negative, data=table_for_regression)
+
+regression_afinn_percentage <- lm(percentage_difference~afinn_sent, data=table_for_regression)
+
+
+regression_nrc_percentage <- lm(percentage_difference~nrc_sentiment+nrc_total+ nrc_positive+nrc_negative+nrc_anger+nrc_fear+nrc_trust+nrc_sadness+nrc_surprise+nrc_joy+nrc_disgust+nrc_anticipation, data=table_for_regression)
+
+
+# ---- doing regression on different dictionaries 
+regression_QDAP_percentage <- lm(percentage_difference~SentimentQDAP+NegativityQDAP+PositivityQDAP, data=sentiment_2)
+regression_HE_percentage <- lm(percentage_difference~PositivityHE+NegativityHE+SentimentHE, data=sentiment_2)
+regression_GI_percentage<- lm(percentage_difference~SentimentGI+PositivityGI+NegativityGI, data=sentiment_2)
+regression_LM2_percentage <- lm(percentage_difference~SentimentLM+NegativityLM+PositivityLM+RatioUncertaintyLM, data=sentiment_2)
+
+
+library(stargazer)
+stargazer::stargazer(regression_LM_percentage, regression_bing_percentage, regression_afinn_percentage, regression_nrc_percentage, regression_QDAP_percentage, regression_HE_percentage, regression_GI_percentage, regression_LM2_percentage, type = "text")
+rm(regression_LM_percentage, regression_afinn_percentage,regression_bing_percentage,regression_nrc_percentage, regression_QDAP_percentage, regression_HE_percentage, regression_GI_percentage, regression_LM2_percentage)
+
+```
+
+```{r final regression on percentage difference, eval=FALSE}
+table_percentage_difference_regression <- table_for_regression %>% dplyr::select(-c(Accession_Number,superfluous,  diff_in_price_close, diff_in_volume))
+
+table_percentage_difference_regression_1<-table_percentage_difference_regression[,-1]
+
+regression_percentage_diff <- lm(formula = percentage_difference ~., data = na.omit(table_percentage_difference_regression_1))
+
+MASS::stepAIC(regression_percentage_diff)
+
+regression_pergentage_diff_1 <- lm(formula = percentage_difference ~ LM_total + LM_sent + LM_positive + 
+    LM_negative + LM_uncertainty + LM_litigious + LM_constraint + 
+    bing_total + bing_sent + bing_positive + joy + surprise + 
+    nrc_total + nrc_sentiment + nrc_positive + nrc_negative + 
+    nrc_anger + nrc_fear + nrc_trust + nrc_surprise + nrc_disgust + 
+    nrc_joy + afinn_sent, data = na.omit(table_percentage_difference_regression_1))
+
+summary(regression_pergentage_diff_1)
+```
+In conclusion, through the use of sentiment analysis the reports have been analysed in the context of the prevalent sentiment presents. Also, following an exploratory analysis of the various dominant sentiments and terms in the reports, regression analysis have been carried, outlining how sentiments explain approximately 11% of the variation of stock prices and 8.6% of the percentage variation in stock price.
+
+
+The third and final segment of the code focuses on topic modelling. Through the use of topic modelling and more specifically structural topic modelling (STM), the analysis  aims at identifying themes and topics present in the corpus. Structural topic modelling has been chosen over Latent Dirichlet Allocation as the latter assumes that  the various documents in the corpus share the same distribution of per-document topic proportions, not considering if documents are positive or negative (Hu et al., 2019). On the other hand, by using STM, the analysis allows the incorporation of the document metadata  into the data generating process of corpus (Roberts et.al,  2014)
+Therefore, the following section will start by creating an unsupervised STM model, that will be consequently used to develop a supervised model, finding an optimum K, that providing a reasonable number of topics will be then used to investigate their relationship with the difference in stock prices. Lastly, the results will be incorporate to the findings of part B to evaluate the additive predictability of the identified topics.
+
+DATA PREPARATION
+The first step consisted in creating a table containing the relevant variables and in a format suitable for STM. In the previous section, a table was created wherein every report had been tokenized, stemmed and lemmatized following the removal of stop-words. Therefore, drawing on the previously obtained table, the observations have been grouped in a format more suitable for topic modelling. The objective of the segment is to extract the relevant topic that appear across the various documents and to observe how much of the price variability they can explain. Therefore, to draw more substantial results the observations have been grouped according to both year and sub-industry. The assumption is that by grouping companies in the same sub-industry and at the same time dividing the reports according to the year that more defined topics will arise. 
+
+
+```{r creating table for topic modelling, eval=FALSE}
+# Creating table containing all relevant information to do topic modelling
+
+# putting lemmatized words back together
+table_part_c <- postagged_table_B_filtered%>% group_by(doc_id) %>% summarise(document=paste0(lemma, collapse = " ")) 
+
+subset_part_c <- table_part_b %>% dplyr::select(Accession_Number,diff_in_price_close, diff_in_volume,year.x, row, percentage_difference) %>% left_join(subset_sub_industry)
+
+annotated_part_c <- table_part_c %>% left_join(subset_part_c, by=c("doc_id"="row")) %>% rename(year=year.x) %>% dplyr::select(Accession_Number, document, year, diff_in_price_close, diff_in_volume, GICS_Sub_Industry, percentage_difference)
+
+annotated_part_c <- annotated_part_c %>% na.omit()
+
+#------- Grouping the document to facilitate the creation of topics
+grouped_annotated_part_c <- annotated_part_c %>% group_by(GICS_Sub_Industry,year) %>% summarise(comments_grouped=paste(document,collapse = " "),
+                                                                            avg_price=mean(diff_in_price_close), avg_percentage_price= mean(percentage_difference))
+
+```
+Successively,  the newly obtained table was used to feed the text processor function. Through an iterative process more and more custom stop-words have been added as they improved the model by further delineating the different topics. 
+```{r processing the documents, eval=FALSE}
+#pre-processing the data 
+set.seed(1234)
+
+#processing the data and adding stopwords
+part_c_processed <- stm::textProcessor(documents = grouped_annotated_part_c$comments_grouped, metadata = grouped_annotated_part_c, customstopwords=c("fiscal", "tax", "financial", "increase", "revenue", "income", "market", "operations", "service", "expense", "revenue","discussion","analysis","financial","condition", "result","operation","follow","discussion", "statement", "fiscal", "company", "sale","management", "business", "customer", "expense", "cost","income", "apply", "year", "net", "note", "cash", "class","price", "product", "end", "january", "february", "march", "april","may", "june", "july", "august", "september", "october", "november","december", "tax", "increase", "decrease", "approximately", "zebra","percent", "report", "asset", "relate", "value", "estimate", "base","change", "service", "compare", "benefit", "certain", "market", "quarter","agreement", "amount", "solution", "operate", "segment", "value", "plan","charge", "term", "rate", "time", "stock", "primarily","interest",
+"impact", "finance", "currency", "account", "benefit", "sell", "average","estimate","flash", "base", "fair", "low", "earning", "percentage", "probability", "merchant", "credit", "loss", "check", "transaction", "debit", "card", "obligation", "fund", "client", "corning", "equity", "purchase", "relate", "loan", "receive", "include", "compensate", "significant", "acquire", "period", "future", "tranaction", "measure", "financial", "financing", "continued", "application", "manufacture", "invest", "offer"), stem = FALSE)
+
+threshold_c <- round(1/100 * length(part_c_processed$documents),0)
+
+out_c <- prepDocuments(part_c_processed$documents,
+                     part_c_processed$vocab,
+                    part_c_processed$meta,
+                     lower.thresh = threshold_c)
+
+saveRDS(out_c, "out_c.rds")
+```
+Having processed the data, the results were fed to the structural topic model, setting K equal to 0 and setting the “init.type” equal to spectral allows for the creation of an unsupervised model. The latter identified 71 different topics. However as per figure 20, it is noticeable how various topics are extremely similar one to another, an indicator that the model can be optimised. 
+
+```{r unsupervised model, eval=FALSE}
+# Running unsupervised STM 
+part_c_k0 <- stm(documents = out_c$documents,
+                vocab = out_c$vocab, K = 0,
+                prevalence = NULL,
+                max.em.its=150,
+                data = out_c$meta, reportevery=5,
+                
+                sigma.prior = 0.7,
+                init.type = "Spectral")
+
+saveRDS(part_c_k0, "part_c_k0.rds")
+
+unsupervised_summary <- summary(part_c_k0)
+
+#-----Plotting the unsupervised STM results 
+plot(part_c_k0)
+topicQuality(part_c_k0, out_c$documents)
+```
+For example, topic 12 and 23 are very closely related having as main terms respectively “Payment, Foreign and Acquisition” and “Payment, Provide and Acquisition”. Or again, looking at topic 20 and 49 having as top terms respectively “Deceptive, Payment and Provide” and “Nonbank, Payment and Provide”. Therefore, through an iterative process the most frequent words have been fed as stop words in the text processor function.
+Furthermore, looking at the Semantic coherence and exclusivity plot (figure 21), it is evident how the topic are majorly focused on one specific area, indicating room for improvement. Semantic coherence can be defined as a measure indicating how well words assigned to a topic reflect the empirical co-occurrence of words within a specific set of documents (Mimno et al. 2011). Also observing the exclusivity of the 71 topics we can see that a very good share of the topics have an exclusivity over 9, signifying distinctiveness in the topics. 
+
+```{r visualising most recurrent word, eval=FALSE}
+# --- Visualising most recurrent words 
+unsupervised_model <- length(unsupervised_summary$topicnums)
+top_words_per_topic <- c()
+
+for (i in 1:unsupervised_model){
+  
+  top_words_per_topic <- c(top_words_per_topic, unsupervised_summary$prob[i,])
+}
+data.frame(word=top_words_per_topic) %>% group_by(word) %>% summarise(count=n()) %>%  arrange(desc(count)) %>% top_n(30) %>% mutate( word= factor(word, word)) %>% ggplot(aes(x=reorder(word, count), y=count)) + geom_bar(stat="identity", colour="blue")+ coord_flip() + labs(title = "Top words per topics", x="word", y="count")
+
+```
+
+Looking at the results stem from the unstructured model, the search K function has been applied. The latter allows the model to run the model on various Ks, so to find the option that best fits the model. As per figure 13, observing the held-out likelihood it appears there are three valid options, 25, 35 and 45. These three options have relatively similar held-out likelihood and semantic coherence values.
+```{r search K, eval=FALSE}
+# Plotting K to find the optimum value 
+
+searchK_result1 <- searchK(out_c$documents, out_c$vocab, K= seq(from=5, to=71 , by=10))
+plot(searchK_result1)
+
+saveRDS(searchK_result1, "searck_k_large.rds")
+
+```
+Given the various option the three most suitable options have been evaluated using a semantic coherence metric, wherein a supervised STM model has been run on the three option and their semantic coherence have been plotted against their exclusivity. As noticeable from figure 24, the three option provide similar results, however, the model with K=45 appears to be slightly better, an hypothesis that has been confirmed when iteratively testing the three options. Furthermore, analysing the exclusivity axis, the model with K=45 appears to have on average, the higher exclusivity, signifying more distinct topics. 
+
+```{r observing semantic coherence for different Ks, eval=FALSE}
+# --- Looking at the search K plot we have various options for K and Using parallel processing with future function
+K_options <- data_frame(K= c(25,35,45)) %>%  mutate(topic_model = future_map(K, ~stm( documents=out_c$documents,vocab=out_c$vocab , K = .,
+                                          verbose = FALSE, seed = TRUE)))
+
+
+
+heldout <- make.heldout(out_c$documents, out_c$vocab)
+
+k_result <- K_options %>%
+  mutate(exclusivity = map(topic_model, exclusivity),
+         semantic_coherence = map(topic_model, semanticCoherence, out_c$documents),
+         eval_heldout = map(topic_model, eval.heldout, heldout$missing),
+         residual = map(topic_model, checkResiduals, out_c$documents),
+         bound =  map_dbl(topic_model, function(x) max(x$convergence$bound)),
+         lfact = map_dbl(topic_model, function(x) lfactorial(x$settings$dim$K)),
+         lbound = bound + lfact,
+         iterations = map_dbl(topic_model, function(x) length(x$convergence$bound)))
+
+
+k_result %>% dplyr::select(K, exclusivity, semantic_coherence)%>%mutate(K=as.factor(K)) %>% unnest() %>% ggplot(aes(semantic_coherence, exclusivity, color = K)) +
+  geom_point(size = 2, alpha = 0.5) +
+  labs(x = "Semantic coherence",
+       y = "Exclusivity",
+       title = "Semating Coherence and exclusivity for for different values of K")
+
+
+```
+Therefore, the next step in the analysis consisted in running a supervised STM model with K=45. Moreover, given the scope of the assignment the average difference in price, grouped by year and sub industry has been used as the prevalence metric.
+
+```{r Supervised STM price, eval=FALSE}
+# ---- Supervised STM
+
+supervised_K_price <- stm(documents = out_c$documents,
+                vocab = out_c$vocab, K = 45,
+                prevalence = ~avg_price,
+                max.em.its=150,
+                data = out_c$meta, reportevery=5,
+                
+                sigma.prior = 0.7,
+                init.type = "Spectral")
+
+supervised_summary <- summary(supervised_K_price)
+
+plot(supervised_K_price)
+topicQuality(supervised_K_price, out_c$documents)
+```
+As per figure 25, the supervised model resulted in more defined topics. For example: 
+
+-	Topic 15: “Related, Investment, Acquisition, License, Consolidate, Maintenance, Division, Require, Intangible and Security” Most likely refers to investments. 
+-	Topic 42: “Operating, Total, Record, Facility, Related, Activity, Lower, Capital, Require and Capital” Most likely refers to  operating activities
+-	Topic 25: “Decline, Margin, Unit, Offset, Lower, Gross, Due, Effect, Continue and Debt” Most likely refers to financial losses
+
+```{r plot of topics, eval=FALSE}
+
+tidy_model <- tidy(supervised_K_price)
+
+tidy_model %>%
+    group_by(topic) %>%
+    top_n(10, beta) %>%
+    ungroup() %>%
+    mutate(topic = paste0("Topic ", topic),
+           term = reorder_within(term, beta, topic)) %>%
+    ggplot(aes(term, beta, fill = as.factor(topic))) +
+    geom_col(alpha = 0.8, show.legend = FALSE) +
+    facet_wrap(~ topic, scales = "free_y") +
+    coord_flip() +
+    scale_x_reordered() +
+    labs(x = NULL, y = expression(beta),
+         title = "Highest word probabilities for each topic",
+         subtitle = "Different words are associated with different topics")
+
+rm(tidy_model)
+```
+The following step consisted in observing the correlation between the 45 obtained topics. As per figure 27, it is noticeable how the topics are understandably correlated (45 topics is a relatively large number of topics), however none of the correlations give reasons to worry. Moreover, observing the PCA plot (figure 28), it is noticeable how many of the topics are similar. Understandable given the nature of the 10-K management reports, that for most industries follow similar structures and topics. Moreover, having analysed only companies from the same industry, the similarity is to be excepted. For example, topic 12 and 31 are almost overlapping, observing the most prominent word per topic (figure 25), it is noticeable how they both refer to investments in technology.  
+```{r gammatopics, eval=FALSE}
+
+gamma_topics_price <- tidy(supervised_K_price, matrix = "theta")
+gamma_topics_price <- gamma_topics_price %>% pivot_wider(names_from = topic, values_from = gamma)
+topic_labels <- paste0("topic_",1:45)
+colnames(gamma_topics_price) <- c("document", topic_labels)
+gamma_topics_45 <- as.data.frame(gamma_topics_price)
+rownames(gamma_topics_price) <- gamma_topics_price$document
+gamma_topics_price$document <- NULL
+#Generate a correlation plot
+corrplot::corrplot(cor(gamma_topics_price))
+
+
+convergence_theta_price <- supervised_K_price$theta
+colnames(convergence_theta_price) <- paste0("topic_", 1:45)
+pcah_price <- FactoMineR::PCA(convergence_theta_price,graph = FALSE)
+factoextra::fviz_pca_var(pcah_price)
+```
+
+```{r most frequent words supervised model, eval=FALSE}
+# ---- Most frequent words in supervised models 
+
+supervised_model <- length(supervised_summary$topicnums)
+top_words_per_topic_supervised <- c()
+
+for (i in 1:supervised_model){
+  
+  top_words_per_topic_supervised <- c(top_words_per_topic_supervised, supervised_summary$prob[i,])
+}
+data.frame(word=top_words_per_topic_supervised) %>% group_by(word) %>% summarise(count=n()) %>%  arrange(desc(count)) %>% top_n(30) %>% mutate( word= factor(word, word)) %>% ggplot(aes(x=reorder(word, count), y=count)) + geom_bar(stat="identity")+ coord_flip()+ labs(title="most recurrent words in supervised model", x="word", y="Frequency")
+
+topic_proportion_supervised <- colMeans(supervised_K_price$theta)
+
+supervised_frex <- data.frame()
+for (i in 1:length(supervised_summary$topicnums)){ 
+  row_here <- tibble(topicnum= supervised_summary$topicnums[i],
+  proportion= 100*round(topic_proportion_supervised[i],4),
+  frex_words= paste(supervised_summary$frex[i, 1:7], collapse=","))
+  supervised_frex = rbind(row_here,supervised_frex)
+}
+
+supervised_frex %>% arrange(desc(proportion))
+```
+
+The following step in the analysis consisted in computing a regression with the newly obtained topics. As per figure 29, it appears that the only significant topic in explaining the variations in the average price difference per year and sub-industry is topic 5.
+```{r significant topics, eval=FALSE}
+
+# Creating tables and plots to see what topic is statistically significant 
+convergence <- as.data.frame(supervised_K_price$theta)
+colnames(convergence) <- paste0("topic", 1:45)
+
+table_topic_regression <- cbind(out_c$meta, convergence) %>% na.omit() %>% dplyr::select(-c(comments_grouped, year, GICS_Sub_Industry, avg_percentage_price))
+
+topic_regression <- lm(avg_price~., na.omit(table_topic_regression))
+
+topic_regression_summary <- as.data.frame(summary(topic_regression)$coefficients)%>% rownames_to_column() %>% mutate(absolute_t_value= abs(`t value`)) %>% arrange(desc(absolute_t_value),10) %>% mutate(rowname= factor(rowname, level=rowname)) %>% mutate(significance=case_when(`Pr(>|t|)` <= 0.001 ~"significant ***", `Pr(>|t|)` <= 0.01 ~ " Significant**", `Pr(>|t|)` <= 0.05 ~"Significant", TRUE ~ "Not Significant")) %>% mutate(r_squared = paste('Multiple R Squared:', as.character(round(summary(topic_regression)$r.squared,3))))
+
+ggplot(topic_regression_summary, aes(x=reorder(rowname,absolute_t_value),y=absolute_t_value, fill=significance))+ geom_bar(stat="identity")+ coord_flip() + labs(x="Topics", y="Absolute t value", title="Topic significance in predicting changes in stock prices from 10-K report")
+```
+Successively a regression has been computed using only topic 5 as variable against the average price (appendix A), the target variable. This led to an adjusted R-squared of 21.44%. However, to ameliorate the regression a backward selection method has been carried, using once again all 45 topics. As per figure 30, the backward selection method, added to the final formula topic 39 and 41, improving the adjusted R-square by 3% achieving 27.4%.
+```{r regression price difference, eval=FALSE}
+# Regression using the only relevant topic 
+topic_5_regression <- lm(formula = avg_price ~ topic5, data =table_topic_regression)
+summary(topic_5_regression)
+
+step_aic_regression <- lm(formula = avg_price ~., data =table_topic_regression)
+MASS::stepAIC(step_aic_regression)
+
+recommended_regression <- lm(formula = avg_price ~ topic5 + topic39 + topic41, data = table_topic_regression)
+
+summary(recommended_regression)
+cloud(supervised_K_price, topic=5, type=c("model"), max.words = 100)
+```
+Further analysing the topics selected by the backward selection method, we can notice the potential labels that can be associated to the three relevant topics. As illustrated by figure 31, topic 5 relates to the software and products present in the information technology industry having words such as “Software, License and Maintenance”. On the other hand, looking at topic 39, it would appear like the topic refers to the day to day activities of the companies. This can be inferred looking at terms such as “Demand, Foreign, Expect, Demand and Decline”. Lastly, topic 41 appears to be related to the financial side of the operations, including words such as “Payment, Liability, Expect and Debt”. 
+
+```{r plot of significant topics price, eval=FALSE}
+tidy_model_price <- tidy(supervised_K_price)
+
+tidy_model_price %>%
+    group_by(topic) %>%
+    top_n(10, beta) %>%
+    ungroup() %>%
+    mutate(topic = paste0("Topic ", topic),
+           term = reorder_within(term, beta, topic))
+
+ relevant_topics_price <-tidy_model_price %>% filter(topic %in% c(5,14)) %>% group_by(topic) %>% top_n(10, beta)
+ 
+ relevant_topics_price %>%  ggplot(aes(term, beta, fill = as.factor(topic))) +
+    geom_col(alpha = 0.8, show.legend = FALSE) +
+    facet_wrap(~ topic, scales = "free_y") +
+    coord_flip() +
+    scale_x_reordered() +
+    labs(x = NULL, y = expression(beta),
+         title = "Highest word probabilities for stock price difference relevant topics",
+         subtitle = "The topics flagged as relevant using backward estimation method")
+ 
+ rm(relevant_topics_price, tidy_model_price)
+```
+Although the results were satisfying the analysis continued. The same steps previously analysed have been executed. However, as a target variable rather than the average difference in price, the average percentage difference has been used. Therefore a second supervised model has been carried. 
+
+```{r supervised model percentage, eval=FALSE}
+supervised_K_percentage <- stm(documents = out_c$documents,
+                vocab = out_c$vocab, K = 25,
+                prevalence = ~avg_percentage_price,
+                max.em.its=150,
+                data = out_c$meta, reportevery=5,
+                
+                sigma.prior = 0.7,
+                init.type = "Spectral")
+
+supervised_percentage_summary <- summary(supervised_K_percentage)
+
+plot(supervised_K_percentage)
+topicQuality(supervised_K_percentage, out_c$documents)
+```
+Once again, a correlation matrix has been plotted (figure 32). However, unsurprisingly, using the same number of topics, the results are identical to those obtained in the creation of the previous correlation matrix. The same applies for the PCA plot. This is due to the fact that both model were fed with the same list, named Out C.
+```{r second gamma topic, eval=FALSE}
+gamma_topics_percentage <- tidy(supervised_K_percentage, matrix = "theta")
+gamma_topics_percentage <- gamma_topics_percentage %>% pivot_wider(names_from = topic, values_from = gamma)
+topic_labels_percentage <- paste0("topic_",1:45)
+colnames(gamma_topics_percentage) <- c("document", topic_labels_percentage)
+gamma_topics_percentage <- as.data.frame(gamma_topics_percentage)
+rownames(gamma_topics_percentage) <- gamma_topics_percentage$document
+gamma_topics_percentage$document <- NULL
+#Generate a correlation plot
+corrplot::corrplot(cor(gamma_topics_percentage))
+
+
+convergence_theta_percentage <- supervised_K_percentage$theta
+colnames(convergence_theta_percentage) <- paste0("topic_", 1:45)
+pcah_percentage <- FactoMineR::PCA(convergence_theta_percentage,graph = FALSE)
+factoextra::fviz_pca_var(pcah_percentage)
+```
+
+Successively, a regression analysis has been carried, using once again all 45 topics. However, as a target variable the percentage difference has been used. As an outcome, the only statistically significant topic was topic 41. 
+```{r significant topics percentage, eval=FALSE}
+
+# Creating tables and plots to see what topic is statistically significant with average percent price difference
+convergence_percentage <- as.data.frame(supervised_K_percentage$theta)
+colnames(convergence_percentage) <- paste0("topic", 1:45)
+
+table_topic_regression_percentage <- cbind(out_c$meta, convergence_percentage) %>% na.omit() %>% dplyr::select(-c(comments_grouped, year, GICS_Sub_Industry, avg_price))
+
+topic_regression_percentage <- lm(avg_percentage_price~., na.omit(table_topic_regression_percentage))
+
+topic_regression_percent_summary <- as.data.frame(summary(topic_regression_percentage)$coefficients)%>% rownames_to_column() %>% mutate(absolute_t_value= abs(`t value`)) %>% arrange(desc(absolute_t_value),10) %>% mutate(rowname= factor(rowname, level=rowname)) %>% mutate(significance=case_when(`Pr(>|t|)` <= 0.001 ~"significant ***", `Pr(>|t|)` <= 0.01 ~ " Significant**", `Pr(>|t|)` <= 0.05 ~"Significant", TRUE ~ "Not Significant")) %>% mutate(r_squared = paste('Multiple R Squared:', as.character(round(summary(topic_regression_percentage)$r.squared,3))))
+
+ggplot(topic_regression_percent_summary, aes(x=reorder(rowname,absolute_t_value),y=absolute_t_value, fill=significance))+ geom_bar(stat="identity")+ coord_flip() + labs(x="Topics", y="Absolute t value", title="Topic significance in predicting average percent changes in stock prices from 10-K report")
+```
+
+Therefore, a regression has been carried using topic 41 as sole explanatory variable and the average percentage difference as target variable. The latter led to an adjusted R-square of 23.46% (Appendix B). However, once again, a backward selection method has been carried in the hope of bettering the result obtained. As per figure 35, when applying the backward selection method 5 topics have been selected, respectively topics: 4,5,20,27 and 41. When used together as explanatory variable against the percentage difference in price per industry and year, these 5 topics have an adjusted R-square of 30.74%, a significant improvement compared to the model using uniquely topic 41.
+```{r regression topic percentage, eval=FALSE}
+# Regression using the only relevant topic for difference in volume
+topic_41_regression <- lm(avg_percentage_price~topic41, data= table_topic_regression_percentage)
+summary(topic_41_regression)
+
+step_aic_percentage_regression <- lm(avg_percentage_price~., data= table_topic_regression_percentage)
+MASS::stepAIC(step_aic_percentage_regression)
+
+recommended_regression_percentage <- lm(formula = avg_percentage_price ~ topic4 + topic5 + topic20 + 
+    topic27 + topic41, data = table_topic_regression_percentage)
+
+summary(recommended_regression_percentage)
+cloud(supervised_K_price, topic=41, type=c("model"), max.words = 100)
+```
+To better understand the topic selected the most prominent words for the selected topics have been plotted (figure 36).  Topic, 5 as previously mentioned, refers to the products and software supplied by the companies present in the information technology industry. Topic 4 on the other hand, appears to be closely related. However it seems to be more concentrated on the physical sales of the software and products by having terms such as “Store, Unit, Software and Provide”. Moving on to topic 20, the top ten terms seem to be describing the operation related to the expansion of businesses. This has been assumed looking at terms such as “Acquisition, Payment, Facility, Employee and Record”. Looking at topic 27, there are less doubts regarding the nature of the topic, it clearly refers to investments. The predominance of the term “investment” is clear and supported by the presence of terms such as “Margin, Gross, Lower and Operating”. Lastly, as previously analysed, topic 41 refers to financial side of the operations including words such as “Payment, Liability, Expect and Debt”. 
+```{r relevant topics percentage, eval=FALSE}
+tidy_model_percentage <- tidy(supervised_K_percentage)
+
+tidy_model_percentage %>%
+    group_by(topic) %>%
+    top_n(10, beta) %>%
+    ungroup() %>%
+    mutate(topic = paste0("Topic ", topic),
+           term = reorder_within(term, beta, topic))
+
+ relevant_topics_percentage <-tidy_model_percentage %>% filter(topic %in% c(4,5,20,27,41)) %>% group_by(topic) %>% top_n(10, beta)
+ 
+ relevant_topics_percentage %>%  ggplot(aes(term, beta, fill = as.factor(topic))) +
+    geom_col(alpha = 0.8, show.legend = FALSE) +
+    facet_wrap(~ topic, scales = "free_y") +
+    coord_flip() +
+    scale_x_reordered() +
+    labs(x = NULL, y = expression(beta),
+         title = "Highest word probabilities for percentage difference relevant topics",
+         subtitle = "The topics flagged as relevant using backward estimation method")
+ 
+ rm(tidy_model_percentage, relevant_topics_percentage)
+```
+Finally, it is time to evaluate whether the significant topics identified throughout part C can aid in improving the results achieved in the models built in part B. To do so the first step undertook consisted in the transformation of the table used in part B to the format used in part C. Therefore the values of the sentiments have been grouped by year and sub-industry and their averages have been used for the regression. 
+Once again, the analysis consisted in the creation of two different model, one using the average price difference as target variable and the other one using the percentage average difference. 
+For the first model, using average price, after carrying an exhaustive model and defining the variable with a backward selection method, it appears that the relevant variables are the topics extracted from part C (figure 36), a very curious finding.
+
+
+```{r eval=FALSE}
+# ----- Selecting relevant variable from part c
+full_data_part_c<- cbind(out_c$meta, convergence) %>% dplyr::select( GICS_Sub_Industry, avg_price, year, topic5, topic39, topic41) %>% na.omit() 
+# ----- Creating Primary Key to merge
+full_data_part_c$PK <- paste(full_data_part_c$GICS_Sub_Industry, " ",full_data_part_c$year)
+
+#-------- Mutating variables in part b to same format as part C
+full_data_part_b <- total_sentiments %>% dplyr::select(-c( diff_in_volume)) %>% rename(year=year.x) %>% group_by(GICS_Sub_Industry,year)  %>% summarise( LM_total=mean(LM_total), LM_sent=mean(LM_sent), LM_positive=mean(LM_positive), LM_negative=mean(LM_negative), LM_uncertainty=mean(LM_uncertainty), LM_litigious=mean(LM_litigious), LM_constraint=mean(LM_constraint), bing_total=mean(bing_total), bing_sent=mean(bing_sent), bing_positive=mean(bing_positive),joy=mean(joy),surprise=mean(surprise), nrc_total=mean(nrc_total),nrc_sentiment=mean(nrc_sentiment), nrc_positive=mean(nrc_positive),nrc_anger=mean(nrc_anger),nrc_fear=mean(nrc_fear),nrc_trust=mean(nrc_trust),nrc_surprise=mean(nrc_surprise),nrc_disgust=mean(nrc_disgust),nrc_joy=mean(nrc_joy), afinn_sent=mean(afinn_sent)) %>% na.omit() 
+
+#-----creating primary key
+full_data_part_b$PK <- paste(full_data_part_b$GICS_Sub_Industry, " ", full_data_part_b$year)
+
+full_data_part_b <- full_data_part_b %>% dplyr::select(-c(year, GICS_Sub_Industry,))
+#----- Joining tables
+additive_predictability_table <- full_data_part_c %>% left_join(full_data_part_b, by="PK")
+additive_predictability_table <- additive_predictability_table %>% rename(GICS_Sub_Industry= GICS_Sub_Industry.x)
+additive_predictability_table$GICS_Sub_Industry.y <- NULL
+# Exhaustive regression Model
+additive_predictability_table_1 <- additive_predictability_table %>% dplyr::select(-c(GICS_Sub_Industry, year, PK))
+regression_additive_predictability <- lm(avg_price~., data=additive_predictability_table_1)
+# ------ Backward selection method
+MASS:: stepAIC(regression_additive_predictability)
+
+# ------ Final regression model
+final_price_additive_regression <- lm(formula = avg_price ~ topic5 + topic41, data = additive_predictability_table_1)
+summary(final_price_additive_regression)
+```
+As per figure 37, the model provides an adjusted R-squared of  25.76%. Compared to the regression model carried in part B, the improvement of approximately 15% can be considered extremely significant. However, the fact that no sentiment have been selected by the backward selection method migh need further investigation. 
+
+
+Successively, the same procedure has been applied using the average percent variation a target variable. In this instance the results are more significant. As noticeable from figure 38, the variables selected by the backward selection method are topic 5, 41, LM_positive, LM_negative, LM_uncertainty, LM_litigious, LM_constraint, joy, nrc_total, nrc_joy, nrc_disgust and afinn_sent. The regression model carried with the mentioned variables leads to an adjusted R-squared of 27.89% (figure39). The results can be considered significant in explaining more of the price percentage difference’s variability compared to the model in part B, whom R-square was only 8.6%.
+```{r eval=FALSE}
+# ----- Selecting relevant variable from part c - percentage
+full_data_percentage_c<- cbind(out_c$meta, convergence) %>% dplyr::select( GICS_Sub_Industry, avg_percentage_price, year, topic4,topic5,topic19, topic27, topic41) %>% na.omit() 
+# ----- Creating Primary Key to merge
+full_data_percentage_c$PK <- paste(full_data_percentage_c$GICS_Sub_Industry, " ",full_data_percentage_c$year)
+
+#-------- Mutating variables in part b to same format as part C - percentage
+full_data_percentage_b <- total_sentiments %>% dplyr::select(-c( diff_in_price_close, diff_in_volume)) %>% rename(year=year.x) %>% group_by(GICS_Sub_Industry,year)  %>% summarise( LM_total=mean(LM_total), LM_sent=mean(LM_sent), LM_positive=mean(LM_positive), LM_negative=mean(LM_negative), LM_uncertainty=mean(LM_uncertainty), LM_litigious=mean(LM_litigious), LM_constraint=mean(LM_constraint), bing_total=mean(bing_total), bing_sent=mean(bing_sent), bing_positive=mean(bing_positive),joy=mean(joy),surprise=mean(surprise), nrc_total=mean(nrc_total),nrc_sentiment=mean(nrc_sentiment), nrc_positive=mean(nrc_positive),nrc_anger=mean(nrc_anger),nrc_fear=mean(nrc_fear),nrc_trust=mean(nrc_trust),nrc_surprise=mean(nrc_surprise),nrc_disgust=mean(nrc_disgust),nrc_joy=mean(nrc_joy), afinn_sent=mean(afinn_sent)) %>% na.omit() 
+
+#-----creating primary key
+full_data_percentage_b$PK <- paste(full_data_percentage_b$GICS_Sub_Industry, " ", full_data_percentage_b$year)
+
+#----- Joining tables
+full_data_percentage_b <- full_data_percentage_b %>% dplyr::select(-c(year, GICS_Sub_Industry,))
+additive_predictability_percentage_table <- full_data_percentage_c %>% left_join(full_data_percentage_b, by="PK")
+additive_predictability_percentage_table <- additive_predictability_percentage_table %>% rename(GICS_Sub_Industry= GICS_Sub_Industry.x)
+additive_predictability_percentage_table$GICS_Sub_Industry.y <- NULL
+
+additive_predictability_percentage_table_1 <- additive_predictability_percentage_table %>% dplyr::select(-c(GICS_Sub_Industry, year, PK))
+
+# Exhaustive regression Model - Percentage
+regression_additive_pergentage_predictability <- lm(avg_percentage_price~., data=additive_predictability_percentage_table_1)
+
+#------- Backward selection method
+MASS:: stepAIC(regression_additive_pergentage_predictability)
+
+# ----- Final regression model - percentage
+final_percentage_additive_regression <- lm(formula = avg_percentage_price ~ topic5 + topic41 + LM_positive + 
+    LM_negative + LM_uncertainty + LM_litigious + LM_constraint + 
+    joy + nrc_total + nrc_disgust + nrc_joy + afinn_sent, data = additive_predictability_percentage_table_1)
+
+summary(final_percentage_additive_regression)
+```
+
+
+In conclusion, in the final segment of the assignment, through topic modelling, the relevant textual features have been extracted from the corpus. This has led to the creation of two supervised model, that when regressed against firstly the average difference per stock price and secondly the percentage difference have achieved R-squared of respectively 27.4% and 30.74%. 
+Moreover, the topic features gathered were merged with the sentiment extracted in part B, in order to estimate the additive predictability. Compared to the regressions’ result in part B, the improvements were considerable.
+However, it must be noted that further analysis would be required prior validating the finding and their actual ability in predicting stock price variation as only a small sample of the S&P 500 has been used. Furthermore, when analysing the stock market, it is naïve to believe that the management discussions alone can have such a bit impact in predicting the stock price change. In fact, in order to have more reliable and tangible results, other unstructured data have to be included, tackling aspects such as behavioural economic and external environmental and economic factors that might influence investors. 
+
+
+
+
+CITATIONS 
+
+Wickham et al., (2019). Welcome to the tidyverse. Journal of Open Source Software,
+4(43), 1686, https://doi.org/10.21105/joss.01686
+  
+  
+Gunratan Lonare and Bharat Patil (2020). edgar: Tool for the U.S. SEC EDGAR Retrieval
+and Parsing of Corporate Filings. R package version 2.0.3.
+https://CRAN.R-project.org/package=edgar
+  
+Nicolas Proellochs and Stefan Feuerriegel (2021). SentimentAnalysis: Dictionary-Based
+Sentiment Analysis. R package version 1.3-4.
+https://CRAN.R-project.org/package=SentimentAnalysis
+  
+Hadley Wickham, Romain François, Lionel Henry and Kirill Müller (2021). dplyr: A
+Grammar of Data Manipulation. R package version 1.0.6.
+https://CRAN.R-project.org/package=dplyr
+  
+Silge J, Robinson D (2016). “tidytext: Text Mining and Analysis Using Tidy Data
+Principles in R.” _JOSS_, *1*(3). doi: 10.21105/joss.00037 (URL:
+https://doi.org/10.21105/joss.00037), <URL: http://dx.doi.org/10.21105/joss.00037>.
+
+Rinker, T. W. (2018). textreadr: Read Text Documents into R version 0.9.1. Buffalo,
+New York. http://github.com/trinker/textreadr
+  
+Marcelo Perlin (2020). BatchGetSymbols: Downloads and Organizes Financial Data for
+Multiple Tickers. R package version 2.6.1.
+https://CRAN.R-project.org/package=BatchGetSymbols
+  
+Henry, Elaine. 2008. “Are Investors Influenced by How Earnings Press Releases Are Written?” Journal of Business Communication 45 (4): 363–407.
+  
+Loughran, Tim, and Bill McDonald. 2011. “When Is a Liability Not a Liability? Textual Analysis, Dictionaries, and 10-Ks.” Journal of Finance 66 (1): 35–65.
+
+Tetlock, Paul C. 2007. “Giving Content to Investor Sentiment: The Role of Media in the Stock Market.” Journal of Finance 62 (3): 1139–68.
+  
